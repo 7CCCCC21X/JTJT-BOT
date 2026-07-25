@@ -13,6 +13,7 @@ import time
 import httpx
 from telegram import (
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MenuButtonCommands,
@@ -46,6 +47,39 @@ ALLOWED_CHAT_IDS = {
 }
 
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+ADDR_LINE_RE = re.compile(r"^(0x[0-9a-fA-F]{40})[\s:,\-]*(.*)$")
+
+
+def parse_entries(text: str) -> list[tuple[str, str]] | None:
+    """把消息解析成 [(地址, 备注), ...]:一行一个地址,地址后可直接跟备注。
+
+    只要有一行不是地址开头就返回 None。
+    """
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = ADDR_LINE_RE.match(line)
+        if not m:
+            return None
+        entries.append((m.group(1), m.group(2).strip()[:40]))
+    return entries or None
+
+
+ADD_PROMPT = ("📝 回复这条消息,发送要监控的地址\n"
+              "一行一个 0x 地址,地址后面可以直接跟备注,例如:\n\n"
+              "0xEe7b429ea01f76102f053213463d4e95d5d24ae8 部署者\n"
+              "0x50614CC8e44F7814549c223aA31db9296e58057c\n\n"
+              "发送后用卡片选择链(可多选)。输入 /cancel 取消")
+
+TOKEN_PROMPT = ("📝 回复这条消息,发送要监控的代币合约地址\n"
+                "一行一个 0x 合约地址,后面可以直接跟备注,例如:\n\n"
+                "0x53f39e5C53EE40bbc3Da97C3B47BD2968d110a8D ALIGN\n\n"
+                "发送后用卡片选择链(可多选)。输入 /cancel 取消")
+
+RECENT_PROMPT = ("📝 回复这条消息,发送要查询的地址(0x 开头),"
+                 "然后用卡片选择链。输入 /cancel 取消")
 
 store = Store()
 
@@ -53,7 +87,7 @@ STATS = {"started": time.time(), "last_poll": 0.0, "polls": 0, "alerts": 0, "err
 
 HELP = f"""🤖 <b>链上监控机器人</b>
 
-直接发送一个 <code>0x...</code> 地址即可开始添加,或用命令:
+直接发送 <code>0x...</code> 地址即可开始添加(支持一行一个批量发送,地址后面可直接跟备注),其余全部用卡片按钮选择。命令:
 
 /menu — 打开按钮菜单
 /add &lt;地址&gt; [链] [备注] — 监控地址的转入/转出(原生币+代币)
@@ -313,6 +347,14 @@ async def _add_by_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ki
     chat_id = update.effective_chat.id
     if not _authorized(chat_id):
         return
+    if not context.args:
+        # 不带参数 → 进入回复式添加流程
+        context.chat_data["pending"] = {"kind": kind, "step": "address"}
+        await update.message.reply_text(
+            ADD_PROMPT if kind == "address" else TOKEN_PROMPT,
+            reply_markup=ForceReply(selective=True,
+                                    input_field_placeholder="0x..."))
+        return
     parsed = _parse_add_args(list(context.args))
     if isinstance(parsed, str):
         await update.message.reply_text(parsed)
@@ -338,9 +380,11 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = list(context.args)
     if not args:
+        context.chat_data["pending"] = {"mode": "recent", "step": "address"}
         await update.message.reply_text(
-            "用法: /recent <地址> [链]\n"
-            "也可以直接发送地址,然后点「📜 查看近10条交易」。")
+            RECENT_PROMPT,
+            reply_markup=ForceReply(selective=True,
+                                    input_field_placeholder="0x..."))
         return
     address = args[0]
     if not ADDR_RE.match(address):
@@ -430,20 +474,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending:
         step = pending.get("step")
         if step == "address":
-            if not ADDR_RE.match(text):
+            entries = parse_entries(text)
+            if not entries:
                 await update.message.reply_text(
-                    "❌ 地址格式不对,请回复 0x 开头的 40 位地址,或 /cancel 取消。")
+                    "❌ 没有识别到有效地址。每行一个 0x 开头的 40 位地址"
+                    "(地址后面可以跟备注),或 /cancel 取消。")
                 return
-            pending["address"] = text
-            pending["step"] = "chain"
             if pending.get("mode") == "recent":
+                pending["entries"] = entries[:1]
+                pending["step"] = "chain"
                 await update.message.reply_text(
-                    f"📜 查询 <code>{text}</code> 近10条交易\n请选择链:",
+                    f"📜 查询 <code>{entries[0][0]}</code> 近10条交易\n请选择链:",
                     parse_mode=ParseMode.HTML, reply_markup=rchain_kb())
             else:
+                pending["entries"] = entries
+                pending["step"] = "chain"
                 pending["chains"] = []
+                desc = (f"<code>{entries[0][0]}</code>" if len(entries) == 1
+                        else f"共 {len(entries)} 个地址")
                 await update.message.reply_text(
-                    f"地址: <code>{text}</code>\n"
+                    f"地址: {desc}\n"
                     "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
                     parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
         elif step == "label":
@@ -451,10 +501,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _finalize_pending(context, chat_id)
         return
 
-    if ADDR_RE.match(text):
-        context.chat_data["pending"] = {"address": text, "step": "kind"}
+    entries = parse_entries(text)
+    if entries:
+        context.chat_data["pending"] = {"entries": entries, "step": "kind"}
+        desc = (f"地址 <code>{entries[0][0]}</code>" if len(entries) == 1
+                else f" {len(entries)} 个地址")
         await update.message.reply_text(
-            f"检测到地址 <code>{text}</code>\n要做什么?",
+            f"检测到{desc}\n要做什么?",
             parse_mode=ParseMode.HTML, reply_markup=kind_kb())
 
 
@@ -478,21 +531,35 @@ def _recent_buttons(chains: list[str], address: str) -> InlineKeyboardMarkup:
 
 async def _finalize_pending(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     pending = context.chat_data.pop("pending", None)
-    if not pending or "address" not in pending:
+    if not pending:
         return
-    chains = pending.get("chains") or ([pending["chain"]] if pending.get("chain") else [])
-    if not chains:
+    entries = pending.get("entries") or []
+    chains = pending.get("chains") or []
+    if not entries or not chains:
         return
-    address = pending["address"]
+    kind = pending.get("kind", "address")
     parts = []
-    for c in chains:
-        parts.append(await create_watch(chat_id, address, c,
-                                        pending.get("kind", "address"),
-                                        pending.get("label", "")))
-    await context.bot.send_message(chat_id, "\n\n".join(parts),
-                                   parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=True,
-                                   reply_markup=_recent_buttons(chains, address))
+    for address, inline_label in entries:
+        label = inline_label or pending.get("label", "")
+        for c in chains:
+            parts.append(await create_watch(chat_id, address, c, kind, label))
+    markup = _recent_buttons(chains, entries[0][0]) if len(entries) == 1 else None
+    # Telegram 单条消息 4096 字符上限,批量添加时分段发送
+    chunk: list[str] = []
+    size = 0
+    for i, part in enumerate(parts):
+        if chunk and size + len(part) > 3500:
+            await context.bot.send_message(chat_id, "\n\n".join(chunk),
+                                           parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True)
+            chunk, size = [], 0
+        chunk.append(part)
+        size += len(part) + 2
+    if chunk:
+        await context.bot.send_message(chat_id, "\n\n".join(chunk),
+                                       parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True,
+                                       reply_markup=markup)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -517,16 +584,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data.split(":", 1)[1]
         if action == "add_addr":
             context.chat_data["pending"] = {"kind": "address", "step": "address"}
-            await q.edit_message_text(
-                "➕ 监控地址(转入/转出)\n\n请直接回复要监控的地址(0x 开头),或 /cancel 取消。")
+            await q.edit_message_text("➕ 监控地址(转入/转出)")
+            await context.bot.send_message(
+                chat_id, ADD_PROMPT,
+                reply_markup=ForceReply(selective=True,
+                                        input_field_placeholder="0x..."))
         elif action == "add_token":
             context.chat_data["pending"] = {"kind": "token", "step": "address"}
-            await q.edit_message_text(
-                "🪙 监控代币合约(全部转账)\n\n请直接回复代币合约地址(0x 开头),或 /cancel 取消。")
+            await q.edit_message_text("🪙 监控代币合约(全部转账)")
+            await context.bot.send_message(
+                chat_id, TOKEN_PROMPT,
+                reply_markup=ForceReply(selective=True,
+                                        input_field_placeholder="0x..."))
         elif action == "recent":
             context.chat_data["pending"] = {"mode": "recent", "step": "address"}
-            await q.edit_message_text(
-                "📜 查询近10条交易\n\n请直接回复要查询的地址(0x 开头),或 /cancel 取消。")
+            await q.edit_message_text("📜 查询近10条交易")
+            await context.bot.send_message(
+                chat_id, RECENT_PROMPT,
+                reply_markup=ForceReply(selective=True,
+                                        input_field_placeholder="0x..."))
         elif action == "list":
             await q.edit_message_text(list_text(chat_id), parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True, reply_markup=menu_kb())
@@ -543,29 +619,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("kind:"):
         await q.answer()
-        if not pending or "address" not in pending:
+        if not pending or not pending.get("entries"):
             await q.edit_message_text("会话已过期,请重新发送地址。")
             return
+        entries = pending["entries"]
         kind = data.split(":", 1)[1]
         if kind == "recent":
             pending["mode"] = "recent"
+            pending["entries"] = entries[:1]
             pending["step"] = "chain"
             await q.edit_message_text(
-                f"📜 查询 <code>{pending['address']}</code> 近10条交易\n请选择链:",
+                f"📜 查询 <code>{entries[0][0]}</code> 近10条交易\n请选择链:",
                 parse_mode=ParseMode.HTML, reply_markup=rchain_kb())
         else:
             pending["kind"] = "token" if kind == "token" else "address"
             pending["step"] = "chain"
             pending["chains"] = []
             kind_txt = "代币监控" if pending["kind"] == "token" else "地址监控"
+            desc = (f"<code>{entries[0][0]}</code>" if len(entries) == 1
+                    else f"共 {len(entries)} 个地址")
             await q.edit_message_text(
-                f"{kind_txt}: <code>{pending['address']}</code>\n"
+                f"{kind_txt}: {desc}\n"
                 "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
                 parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
         return
 
     if data.startswith("chsel:"):
-        if not pending or "address" not in pending:
+        if not pending or not pending.get("entries"):
             await q.answer()
             await q.edit_message_text("会话已过期,请重新发送地址。")
             return
@@ -576,13 +656,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("请至少选择一条链", show_alert=True)
                 return
             await q.answer()
-            pending["step"] = "label"
-            names = "、".join(CHAINS[c]["name"] for c in selected)
-            await q.edit_message_text(
-                f"链: {names}\n"
-                f"地址: <code>{pending['address']}</code>\n\n"
-                "请直接回复备注文字(如「部署者钱包」),或点击跳过:",
-                parse_mode=ParseMode.HTML, reply_markup=label_kb())
+            entries = pending["entries"]
+            # 单个地址且没带备注时,多问一步备注;批量或已带备注则直接添加
+            if len(entries) == 1 and not entries[0][1]:
+                pending["step"] = "label"
+                names = "、".join(CHAINS[c]["name"] for c in selected)
+                await q.edit_message_text(
+                    f"链: {names}\n"
+                    f"地址: <code>{entries[0][0]}</code>\n\n"
+                    "请直接回复备注文字(如「部署者钱包」),或点击跳过:",
+                    parse_mode=ParseMode.HTML, reply_markup=label_kb())
+            else:
+                await q.edit_message_text("⏳ 正在添加…")
+                await _finalize_pending(context, chat_id)
         elif key in CHAINS:
             await q.answer()
             selected = pending.setdefault("chains", [])
@@ -595,13 +681,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rchain:"):
         await q.answer()
-        if not pending or "address" not in pending:
+        if not pending or not pending.get("entries"):
             await q.edit_message_text("会话已过期,请重新发送地址。")
             return
         chain = data.split(":", 1)[1]
         if chain not in CHAINS:
             return
-        address = pending["address"]
+        address = pending["entries"][0][0]
         context.chat_data.pop("pending", None)
         await q.edit_message_text(f"⏳ 正在查询 {CHAINS[chain]['name']} 上的交易…")
         await _send_recent(context.bot, chat_id, chain, address)
@@ -706,7 +792,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler(["add", "watch"], cmd_add))
     app.add_handler(CommandHandler(["addtoken", "add_token"], cmd_addtoken))
     app.add_handler(CommandHandler(["recent", "last", "txs"], cmd_recent))
     app.add_handler(CommandHandler(["label", "note"], cmd_label))
