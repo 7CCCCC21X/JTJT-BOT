@@ -15,6 +15,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonCommands,
     Update,
 )
 from telegram.constants import ParseMode
@@ -547,6 +548,8 @@ async def post_init(app: Application):
         BotCommand("cancel", "取消当前添加流程"),
         BotCommand("help", "帮助"),
     ])
+    # 输入框左侧的蓝色「菜单」按钮,点开即命令列表
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 def main():
