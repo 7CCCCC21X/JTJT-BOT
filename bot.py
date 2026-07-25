@@ -489,13 +489,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 pending["entries"] = entries
                 pending["step"] = "chain"
-                pending["chains"] = []
-                desc = (f"<code>{entries[0][0]}</code>" if len(entries) == 1
-                        else f"共 {len(entries)} 个地址")
-                await update.message.reply_text(
-                    f"地址: {desc}\n"
-                    "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
-                    parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
+                if len(entries) == 1:
+                    msg = await update.message.reply_text("🔍 正在识别地址类型…")
+                    det = await monitor.detect_address(entries[0][0])
+                    pending["detect"] = det
+                    preselect = (detected_token_chains(det)
+                                 if pending.get("kind") == "token" else [])
+                    pending["chains"] = list(preselect)
+                    extra = detect_summary(det)
+                    if pending.get("kind") == "token" and not preselect:
+                        extra += "\n⚠️ 未在任何链上检测到代币合约,请确认地址。"
+                    await msg.edit_text(
+                        f"地址: <code>{entries[0][0]}</code>\n{extra}\n\n"
+                        "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=chain_multi_kb(set(preselect)))
+                else:
+                    pending["chains"] = []
+                    await update.message.reply_text(
+                        f"地址: 共 {len(entries)} 个\n"
+                        "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
+                        parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
         elif step == "label":
             pending["label"] = text[:40]
             await _finalize_pending(context, chat_id)
@@ -504,11 +518,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries = parse_entries(text)
     if entries:
         context.chat_data["pending"] = {"entries": entries, "step": "kind"}
-        desc = (f"地址 <code>{entries[0][0]}</code>" if len(entries) == 1
-                else f" {len(entries)} 个地址")
-        await update.message.reply_text(
-            f"检测到{desc}\n要做什么?",
-            parse_mode=ParseMode.HTML, reply_markup=kind_kb())
+        if len(entries) == 1:
+            msg = await update.message.reply_text("🔍 正在识别地址类型…")
+            det = await monitor.detect_address(entries[0][0])
+            context.chat_data["pending"]["detect"] = det
+            await msg.edit_text(
+                f"检测到地址 <code>{entries[0][0]}</code>\n"
+                f"{detect_summary(det)}\n\n要做什么?",
+                parse_mode=ParseMode.HTML, reply_markup=kind_kb())
+        else:
+            await update.message.reply_text(
+                f"检测到 {len(entries)} 个地址\n要做什么?",
+                parse_mode=ParseMode.HTML, reply_markup=kind_kb())
+
+
+def detect_summary(det: dict) -> str:
+    """把 detect_address 的结果整理成一段说明文字。"""
+    if not det:
+        return ""
+    lines = []
+    for c, info in det.items():
+        if info["type"] == "token":
+            symbol = f" ({info['symbol']})" if info.get("symbol") else ""
+            lines.append(f"🪙 {CHAINS[c]['name']}: 代币合约{symbol}")
+        elif info["type"] == "contract":
+            lines.append(f"📄 {CHAINS[c]['name']}: 合约地址")
+    if not lines:
+        return "🔍 识别结果: 👤 普通地址 (EOA)"
+    return "🔍 识别结果:\n" + "\n".join(lines)
+
+
+def detected_token_chains(det: dict) -> list[str]:
+    return [c for c, info in (det or {}).items() if info["type"] == "token"]
 
 
 async def _send_recent(bot, chat_id: int, chain: str, address: str):
@@ -634,14 +675,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             pending["kind"] = "token" if kind == "token" else "address"
             pending["step"] = "chain"
-            pending["chains"] = []
+            det = pending.get("detect") or {}
+            preselect = detected_token_chains(det) if pending["kind"] == "token" else []
+            pending["chains"] = list(preselect)
             kind_txt = "代币监控" if pending["kind"] == "token" else "地址监控"
             desc = (f"<code>{entries[0][0]}</code>" if len(entries) == 1
                     else f"共 {len(entries)} 个地址")
+            hint = ""
+            if pending["kind"] == "token" and preselect:
+                hint = "\n已自动选中检测到该代币的链 ✅"
+            elif pending["kind"] == "token" and det and not preselect:
+                hint = "\n⚠️ 未在任何链上检测到代币合约,请确认地址。"
             await q.edit_message_text(
-                f"{kind_txt}: {desc}\n"
+                f"{kind_txt}: {desc}{hint}\n"
                 "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
-                parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
+                parse_mode=ParseMode.HTML,
+                reply_markup=chain_multi_kb(set(preselect)))
         return
 
     if data.startswith("chsel:"):

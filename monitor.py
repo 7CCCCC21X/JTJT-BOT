@@ -99,6 +99,51 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
     return fresh
 
 
+async def _proxy(client: httpx.AsyncClient, chain: str, action: str, address: str):
+    """Etherscan proxy 模块 (JSON-RPC 透传),返回 result 原文。"""
+    q = {
+        "chainid": CHAINS[chain]["chain_id"],
+        "apikey": API_KEY,
+        "module": "proxy",
+        "action": action,
+        "address": address,
+        "tag": "latest",
+    }
+    resp = await client.get(API_URL, params=q, timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+async def detect_address(address: str) -> dict[str, dict]:
+    """识别地址在每条链上的类型: eoa(普通地址) / contract(合约) / token(代币合约)。
+
+    有合约代码 → contract;合约且有代币转账记录 → token(带 symbol)。
+    """
+    result: dict[str, dict] = {}
+    async with httpx.AsyncClient() as client:
+        for chain in CHAINS:
+            info = {"type": "eoa", "symbol": None}
+            try:
+                code = await _proxy(client, chain, "eth_getCode", address)
+                if isinstance(code, str) and code.startswith("0x") and len(code) > 4:
+                    info["type"] = "contract"
+                    await asyncio.sleep(REQUEST_GAP)
+                    rows = await _query(client, chain, {
+                        "module": "account", "action": "tokentx",
+                        "contractaddress": address,
+                        "page": 1, "offset": 1, "sort": "desc",
+                        "startblock": 0, "endblock": 999999999,
+                    })
+                    if rows:
+                        info["type"] = "token"
+                        info["symbol"] = rows[0].get("tokenSymbol") or None
+            except Exception as e:
+                log.debug("detect failed on %s: %s", chain, e)
+            result[chain] = info
+            await asyncio.sleep(REQUEST_GAP)
+    return result
+
+
 async def fetch_recent(chain: str, address: str, limit: int = 10) -> list[dict]:
     """Fetch the latest transactions (native + token) for an address, newest first."""
     common = {
