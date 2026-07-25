@@ -8,7 +8,10 @@ import json
 import os
 import threading
 
-DATA_DIR = os.environ.get("DATA_DIR", "data")
+# 优先级: DATA_DIR 显式指定 > Railway Volume 挂载路径(自动注入) > 本地 data/
+DATA_DIR = (os.environ.get("DATA_DIR")
+            or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+            or "data")
 DATA_FILE = os.path.join(DATA_DIR, "watches.json")
 
 _lock = threading.Lock()
