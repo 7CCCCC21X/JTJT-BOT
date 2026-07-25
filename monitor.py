@@ -35,9 +35,9 @@ class EtherscanError(Exception):
 FALLBACKS: dict[str, list[tuple[str, str, bool]]] = {
     "eth": [("scan", "https://eth.blockscout.com/api", False),
             ("rpc", "https://ethereum-rpc.publicnode.com", False)],
-    "bsc": [("rpc", "https://bsc-dataseed.bnbchain.org", False),
-            ("rpc", "https://bsc-dataseed1.bnbchain.org", False),
-            ("rpc", "https://bsc-rpc.publicnode.com", False)],
+    "bsc": [("rpc", "https://bsc-rpc.publicnode.com", False),
+            ("rpc", "https://bsc-dataseed.bnbchain.org", False),
+            ("rpc", "https://bsc-dataseed1.bnbchain.org", False)],
     "base": [("scan", "https://base.blockscout.com/api", False),
              ("rpc", "https://mainnet.base.org", False)],
     "arb": [("scan", "https://arbitrum.blockscout.com/api", False),
@@ -50,7 +50,8 @@ _fallback_urls: dict[str, tuple[str, str, bool]] = {}  # 探测成功后缓存
 
 TRANSFER_TOPIC = ("0xddf252ad1be2c89b69c2b068"
                   "fc378daa952ba7f163c4a11628f55a4df523b3ef")
-RPC_LOG_SPAN = int(os.environ.get("RPC_LOG_SPAN", "2000"))  # getLogs 最大回看区块数
+RPC_LOG_SPAN = int(os.environ.get("RPC_LOG_SPAN", "1000"))  # getLogs 最大回看区块数
+_rpc_spans: dict[str, int] = {}  # 各节点实测可用的回看窗口
 
 
 def _candidates(chain: str) -> list[tuple[str, str, bool]]:
@@ -112,25 +113,39 @@ async def _token_info(client: httpx.AsyncClient, url: str, contract: str) -> tup
 async def _rpc_tokentx(client: httpx.AsyncClient, url: str, params: dict) -> list[dict]:
     """用 eth_getLogs 拉取 ERC-20 Transfer 事件,适配成 tokentx 行格式。"""
     latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
-    start = int(params.get("startblock", 0) or 0)
-    if start <= 0 or latest - start > RPC_LOG_SPAN:
-        start = max(latest - RPC_LOG_SPAN, 0)
-    frm, to = hex(start), hex(latest)
-    filters = []
-    if "contractaddress" in params and "address" not in params:
-        filters.append({"address": params["contractaddress"],
-                        "topics": [TRANSFER_TOPIC],
-                        "fromBlock": frm, "toBlock": to})
-    else:
+    want_start = int(params.get("startblock", 0) or 0)
+    span = _rpc_spans.get(url, RPC_LOG_SPAN)
+
+    def build_filters(frm: str, to: str) -> list[dict]:
+        if "contractaddress" in params and "address" not in params:
+            return [{"address": params["contractaddress"],
+                     "topics": [TRANSFER_TOPIC],
+                     "fromBlock": frm, "toBlock": to}]
         padded = "0x" + params["address"].lower().replace("0x", "").rjust(64, "0")
-        filters.append({"topics": [TRANSFER_TOPIC, padded],
-                        "fromBlock": frm, "toBlock": to})
-        filters.append({"topics": [TRANSFER_TOPIC, None, padded],
-                        "fromBlock": frm, "toBlock": to})
-    logs = []
-    for f in filters:
-        logs.extend(await _rpc_call(client, url, "eth_getLogs", [f]) or [])
-        await asyncio.sleep(REQUEST_GAP)
+        return [{"topics": [TRANSFER_TOPIC, padded],
+                 "fromBlock": frm, "toBlock": to},
+                {"topics": [TRANSFER_TOPIC, None, padded],
+                 "fromBlock": frm, "toBlock": to}]
+
+    logs = None
+    while logs is None:
+        start = want_start
+        if start <= 0 or latest - start > span:
+            start = max(latest - span, 0)
+        try:
+            collected = []
+            for f in build_filters(hex(start), hex(latest)):
+                collected.extend(
+                    await _rpc_call(client, url, "eth_getLogs", [f]) or [])
+                await asyncio.sleep(REQUEST_GAP)
+            logs = collected
+            _rpc_spans[url] = span  # 记住该节点实测可用的窗口
+        except EtherscanError as e:
+            # 节点限制范围/结果数时,缩小回看窗口重试
+            if ("limit" in str(e).lower() or "range" in str(e).lower()) and span > 50:
+                span = max(span // 4, 50)
+                continue
+            raise
     rows, seen = [], set()
     for lg in logs:
         topics = lg.get("topics") or []
@@ -216,10 +231,21 @@ async def _fallback_do(client: httpx.AsyncClient, cand: tuple[str, str, bool],
 
 async def _fallback_query(client: httpx.AsyncClient, chain: str,
                           params: dict) -> list[dict]:
-    if chain in _fallback_urls:
-        return await _fallback_do(client, _fallback_urls[chain], params)
     errors = []
+    failed = None
+    if chain in _fallback_urls:
+        cand = _fallback_urls[chain]
+        try:
+            return await _fallback_do(client, cand, params)
+        except Exception as e:
+            # 缓存的源坏了:剔除并立刻尝试其他候选
+            failed = cand
+            _fallback_urls.pop(chain, None)
+            errors.append(f"{cand[1]}: {str(e)[:80]}")
+            log.warning("fallback source %s failed, re-probing: %s", cand[1], e)
     for cand in _candidates(chain):
+        if cand == failed:
+            continue
         try:
             rows = await _fallback_do(client, cand, params)
             _fallback_urls[chain] = cand
