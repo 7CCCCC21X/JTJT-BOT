@@ -41,6 +41,11 @@ async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[di
     result = data.get("result")
     if "No transactions found" in message or result == []:
         return []
+    if "Invalid API Key" in str(result) or "Invalid API Key" in message:
+        raise EtherscanError(
+            "Etherscan API Key 无效。请在 Railway 的 Variables 里把 "
+            "ETHERSCAN_API_KEY 换成 etherscan.io/myapikey 申请的 key"
+            "(V2 多链通用,BscScan 旧 key 不可用)")
     raise EtherscanError(f"{message}: {result}")
 
 
