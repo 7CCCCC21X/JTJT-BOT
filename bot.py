@@ -58,6 +58,7 @@ HELP = f"""🤖 <b>链上监控机器人</b>
 /menu — 打开按钮菜单
 /add &lt;地址&gt; [链] [备注] — 监控地址的转入/转出(原生币+代币)
 /addtoken &lt;合约&gt; [链] [备注] — 监控代币合约的<b>所有</b>转账
+/recent &lt;地址&gt; [链] — 查看地址近10条交易
 /label &lt;地址&gt; [链] &lt;备注&gt; — 修改已监控地址的备注
 /remove &lt;地址&gt; [链] — 取消监控
 /list — 查看当前监控列表
@@ -79,14 +80,18 @@ def _authorized(chat_id: int) -> bool:
 
 # ---------- 卡片键盘 ----------
 
+CHAIN_ICONS = {"eth": "⟠", "bsc": "🟡", "base": "🔵", "arb": "🔷", "polygon": "🟣"}
+
+
 def menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ 监控地址", callback_data="menu:add_addr"),
          InlineKeyboardButton("🪙 监控代币", callback_data="menu:add_token")],
-        [InlineKeyboardButton("📋 监控列表", callback_data="menu:list"),
-         InlineKeyboardButton("📊 运行状态", callback_data="menu:status")],
-        [InlineKeyboardButton("🧪 测试推送", callback_data="menu:test"),
-         InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
+        [InlineKeyboardButton("📜 查近10条交易", callback_data="menu:recent"),
+         InlineKeyboardButton("📋 监控列表", callback_data="menu:list")],
+        [InlineKeyboardButton("📊 运行状态", callback_data="menu:status"),
+         InlineKeyboardButton("🧪 测试推送", callback_data="menu:test")],
+        [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
     ])
 
 
@@ -94,17 +99,36 @@ def kind_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 地址监控(转入/转出)", callback_data="kind:address")],
         [InlineKeyboardButton("🪙 代币监控(该代币全部转账)", callback_data="kind:token")],
+        [InlineKeyboardButton("📜 查看近10条交易", callback_data="kind:recent")],
         [InlineKeyboardButton("❌ 取消", callback_data="cancel")],
     ])
 
 
-def chain_kb() -> InlineKeyboardMarkup:
+def chain_multi_kb(selected: set[str]) -> InlineKeyboardMarkup:
+    """多选链卡片:点击切换选中,✅ 表示已选,选完点「完成」。"""
+    def btn(key: str) -> InlineKeyboardButton:
+        mark = "✅ " if key in selected else ""
+        return InlineKeyboardButton(
+            f"{mark}{CHAIN_ICONS[key]} {CHAINS[key]['name']}",
+            callback_data=f"chsel:{key}")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⟠ Ethereum", callback_data="chain:eth"),
-         InlineKeyboardButton("🟡 BNB Chain", callback_data="chain:bsc")],
-        [InlineKeyboardButton("🔵 Base", callback_data="chain:base"),
-         InlineKeyboardButton("🔷 Arbitrum", callback_data="chain:arb")],
-        [InlineKeyboardButton("🟣 Polygon", callback_data="chain:polygon"),
+        [btn("eth"), btn("bsc")],
+        [btn("base"), btn("arb")],
+        [btn("polygon")],
+        [InlineKeyboardButton("✔️ 完成", callback_data="chsel:done"),
+         InlineKeyboardButton("❌ 取消", callback_data="cancel")],
+    ])
+
+
+def rchain_kb() -> InlineKeyboardMarkup:
+    """单选链卡片(近10条交易查询用)。"""
+    def btn(key: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            f"{CHAIN_ICONS[key]} {CHAINS[key]['name']}", callback_data=f"rchain:{key}")
+    return InlineKeyboardMarkup([
+        [btn("eth"), btn("bsc")],
+        [btn("base"), btn("arb")],
+        [btn("polygon"),
          InlineKeyboardButton("❌ 取消", callback_data="cancel")],
     ])
 
@@ -296,7 +320,8 @@ async def _add_by_command(update: Update, context: ContextTypes.DEFAULT_TYPE, ki
     address, chain, label = parsed
     text = await create_watch(chat_id, address, chain, kind, label)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML,
-                                    disable_web_page_preview=True)
+                                    disable_web_page_preview=True,
+                                    reply_markup=_recent_buttons([chain], address))
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,6 +330,30 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _add_by_command(update, context, "token")
+
+
+async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _authorized(chat_id):
+        return
+    args = list(context.args)
+    if not args:
+        await update.message.reply_text(
+            "用法: /recent <地址> [链]\n"
+            "也可以直接发送地址,然后点「📜 查看近10条交易」。")
+        return
+    address = args[0]
+    if not ADDR_RE.match(address):
+        await update.message.reply_text("❌ 地址格式不对,应为 0x 开头的 40 位十六进制。")
+        return
+    chain = DEFAULT_CHAIN
+    if len(args) > 1:
+        chain = resolve_chain(args[1])
+        if not chain:
+            await update.message.reply_text("❌ 不认识这条链,/chains 查看支持列表。")
+            return
+    await update.message.reply_text(f"⏳ 正在查询 {CHAINS[chain]['name']} 上的交易…")
+    await _send_recent(context.bot, chat_id, chain, address)
 
 
 async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +420,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- 卡片流程(回复消息添加) ----------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理普通文本:进行中的添加流程,或直接发来的 0x 地址。"""
+    """处理普通文本:进行中的添加/查询流程,或直接发来的 0x 地址。"""
     chat_id = update.effective_chat.id
     if not _authorized(chat_id) or not update.message or not update.message.text:
         return
@@ -387,9 +436,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             pending["address"] = text
             pending["step"] = "chain"
-            await update.message.reply_text(
-                f"地址: <code>{text}</code>\n请选择所在链:",
-                parse_mode=ParseMode.HTML, reply_markup=chain_kb())
+            if pending.get("mode") == "recent":
+                await update.message.reply_text(
+                    f"📜 查询 <code>{text}</code> 近10条交易\n请选择链:",
+                    parse_mode=ParseMode.HTML, reply_markup=rchain_kb())
+            else:
+                pending["chains"] = []
+                await update.message.reply_text(
+                    f"地址: <code>{text}</code>\n"
+                    "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
+                    parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
         elif step == "label":
             pending["label"] = text[:40]
             await _finalize_pending(context, chat_id)
@@ -398,18 +454,45 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ADDR_RE.match(text):
         context.chat_data["pending"] = {"address": text, "step": "kind"}
         await update.message.reply_text(
-            f"检测到地址 <code>{text}</code>\n要如何监控?",
+            f"检测到地址 <code>{text}</code>\n要做什么?",
             parse_mode=ParseMode.HTML, reply_markup=kind_kb())
+
+
+async def _send_recent(bot, chat_id: int, chain: str, address: str):
+    try:
+        txs = await monitor.fetch_recent(chain, address, 10)
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ 查询失败: {e}")
+        return
+    await bot.send_message(chat_id, monitor.format_recent(chain, address, txs),
+                           parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+def _recent_buttons(chains: list[str], address: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📜 {CHAINS[c]['name']} 近10条交易",
+                              callback_data=f"recent:{c}:{address}")]
+        for c in chains
+    ])
 
 
 async def _finalize_pending(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     pending = context.chat_data.pop("pending", None)
-    if not pending or "address" not in pending or "chain" not in pending:
+    if not pending or "address" not in pending:
         return
-    text = await create_watch(chat_id, pending["address"], pending["chain"],
-                              pending.get("kind", "address"), pending.get("label", ""))
-    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=True)
+    chains = pending.get("chains") or ([pending["chain"]] if pending.get("chain") else [])
+    if not chains:
+        return
+    address = pending["address"]
+    parts = []
+    for c in chains:
+        parts.append(await create_watch(chat_id, address, c,
+                                        pending.get("kind", "address"),
+                                        pending.get("label", "")))
+    await context.bot.send_message(chat_id, "\n\n".join(parts),
+                                   parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True,
+                                   reply_markup=_recent_buttons(chains, address))
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,72 +504,128 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
     data = q.data or ""
-    await q.answer()
+    pending = context.chat_data.get("pending")
 
     if data == "cancel":
+        await q.answer()
         context.chat_data.pop("pending", None)
         await q.edit_message_text("已取消。")
+        return
 
-    elif data == "menu:add_addr":
-        context.chat_data["pending"] = {"kind": "address", "step": "address"}
-        await q.edit_message_text(
-            "➕ 监控地址(转入/转出)\n\n请直接回复要监控的地址(0x 开头),或 /cancel 取消。")
+    if data.startswith("menu:"):
+        await q.answer()
+        action = data.split(":", 1)[1]
+        if action == "add_addr":
+            context.chat_data["pending"] = {"kind": "address", "step": "address"}
+            await q.edit_message_text(
+                "➕ 监控地址(转入/转出)\n\n请直接回复要监控的地址(0x 开头),或 /cancel 取消。")
+        elif action == "add_token":
+            context.chat_data["pending"] = {"kind": "token", "step": "address"}
+            await q.edit_message_text(
+                "🪙 监控代币合约(全部转账)\n\n请直接回复代币合约地址(0x 开头),或 /cancel 取消。")
+        elif action == "recent":
+            context.chat_data["pending"] = {"mode": "recent", "step": "address"}
+            await q.edit_message_text(
+                "📜 查询近10条交易\n\n请直接回复要查询的地址(0x 开头),或 /cancel 取消。")
+        elif action == "list":
+            await q.edit_message_text(list_text(chat_id), parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True, reply_markup=menu_kb())
+        elif action == "status":
+            await q.edit_message_text(status_text(chat_id), parse_mode=ParseMode.HTML,
+                                      reply_markup=menu_kb())
+        elif action == "test":
+            await q.edit_message_text("🧪 正在发送测试…")
+            await run_test(chat_id, context.bot)
+        elif action == "help":
+            await q.edit_message_text(HELP, parse_mode=ParseMode.HTML,
+                                      reply_markup=menu_kb())
+        return
 
-    elif data == "menu:add_token":
-        context.chat_data["pending"] = {"kind": "token", "step": "address"}
-        await q.edit_message_text(
-            "🪙 监控代币合约(全部转账)\n\n请直接回复代币合约地址(0x 开头),或 /cancel 取消。")
-
-    elif data == "menu:list":
-        await q.edit_message_text(list_text(chat_id), parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True, reply_markup=menu_kb())
-
-    elif data == "menu:status":
-        await q.edit_message_text(status_text(chat_id), parse_mode=ParseMode.HTML,
-                                  reply_markup=menu_kb())
-
-    elif data == "menu:test":
-        await q.edit_message_text("🧪 正在发送测试…")
-        await run_test(chat_id, context.bot)
-
-    elif data == "menu:help":
-        await q.edit_message_text(HELP, parse_mode=ParseMode.HTML,
-                                  reply_markup=menu_kb())
-
-    elif data.startswith("kind:"):
-        pending = context.chat_data.get("pending")
+    if data.startswith("kind:"):
+        await q.answer()
         if not pending or "address" not in pending:
             await q.edit_message_text("会话已过期,请重新发送地址。")
             return
-        pending["kind"] = "token" if data == "kind:token" else "address"
-        pending["step"] = "chain"
-        kind_txt = "代币监控" if pending["kind"] == "token" else "地址监控"
-        await q.edit_message_text(
-            f"{kind_txt}: <code>{pending['address']}</code>\n请选择所在链:",
-            parse_mode=ParseMode.HTML, reply_markup=chain_kb())
+        kind = data.split(":", 1)[1]
+        if kind == "recent":
+            pending["mode"] = "recent"
+            pending["step"] = "chain"
+            await q.edit_message_text(
+                f"📜 查询 <code>{pending['address']}</code> 近10条交易\n请选择链:",
+                parse_mode=ParseMode.HTML, reply_markup=rchain_kb())
+        else:
+            pending["kind"] = "token" if kind == "token" else "address"
+            pending["step"] = "chain"
+            pending["chains"] = []
+            kind_txt = "代币监控" if pending["kind"] == "token" else "地址监控"
+            await q.edit_message_text(
+                f"{kind_txt}: <code>{pending['address']}</code>\n"
+                "请选择所在链(<b>可多选</b>,选完点「✔️ 完成」):",
+                parse_mode=ParseMode.HTML, reply_markup=chain_multi_kb(set()))
+        return
 
-    elif data.startswith("chain:"):
-        pending = context.chat_data.get("pending")
+    if data.startswith("chsel:"):
+        if not pending or "address" not in pending:
+            await q.answer()
+            await q.edit_message_text("会话已过期,请重新发送地址。")
+            return
+        key = data.split(":", 1)[1]
+        if key == "done":
+            selected = pending.get("chains") or []
+            if not selected:
+                await q.answer("请至少选择一条链", show_alert=True)
+                return
+            await q.answer()
+            pending["step"] = "label"
+            names = "、".join(CHAINS[c]["name"] for c in selected)
+            await q.edit_message_text(
+                f"链: {names}\n"
+                f"地址: <code>{pending['address']}</code>\n\n"
+                "请直接回复备注文字(如「部署者钱包」),或点击跳过:",
+                parse_mode=ParseMode.HTML, reply_markup=label_kb())
+        elif key in CHAINS:
+            await q.answer()
+            selected = pending.setdefault("chains", [])
+            if key in selected:
+                selected.remove(key)
+            else:
+                selected.append(key)
+            await q.edit_message_reply_markup(reply_markup=chain_multi_kb(set(selected)))
+        return
+
+    if data.startswith("rchain:"):
+        await q.answer()
         if not pending or "address" not in pending:
             await q.edit_message_text("会话已过期,请重新发送地址。")
             return
         chain = data.split(":", 1)[1]
         if chain not in CHAINS:
             return
-        pending["chain"] = chain
-        pending["step"] = "label"
-        await q.edit_message_text(
-            f"链: {CHAINS[chain]['name']}\n"
-            f"地址: <code>{pending['address']}</code>\n\n"
-            "请直接回复备注文字(如「部署者钱包」),或点击跳过:",
-            parse_mode=ParseMode.HTML, reply_markup=label_kb())
+        address = pending["address"]
+        context.chat_data.pop("pending", None)
+        await q.edit_message_text(f"⏳ 正在查询 {CHAINS[chain]['name']} 上的交易…")
+        await _send_recent(context.bot, chat_id, chain, address)
+        return
 
-    elif data == "label:skip":
-        pending = context.chat_data.get("pending")
+    if data.startswith("recent:"):
+        await q.answer()
+        try:
+            _, chain, address = data.split(":", 2)
+        except ValueError:
+            return
+        if chain in CHAINS and ADDR_RE.match(address):
+            await _send_recent(context.bot, chat_id, chain, address)
+        return
+
+    if data == "label:skip":
+        await q.answer()
         if pending is not None:
             pending["label"] = ""
         await q.edit_message_text("⏳ 正在添加…")
         await _finalize_pending(context, chat_id)
+        return
+
+    await q.answer()
 
 
 # ---------- 轮询 ----------
@@ -539,6 +678,7 @@ async def post_init(app: Application):
         BotCommand("menu", "打开按钮菜单"),
         BotCommand("add", "监控地址 <地址> [链] [备注]"),
         BotCommand("addtoken", "监控代币合约 <合约> [链] [备注]"),
+        BotCommand("recent", "查近10条交易 <地址> [链]"),
         BotCommand("list", "查看监控列表"),
         BotCommand("status", "查看运行状态"),
         BotCommand("test", "测试推送与 API 检测"),
@@ -568,6 +708,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler(["addtoken", "add_token"], cmd_addtoken))
+    app.add_handler(CommandHandler(["recent", "last", "txs"], cmd_recent))
     app.add_handler(CommandHandler(["label", "note"], cmd_label))
     app.add_handler(CommandHandler(["remove", "rm", "del"], cmd_remove))
     app.add_handler(CommandHandler(["list", "ls"], cmd_list))

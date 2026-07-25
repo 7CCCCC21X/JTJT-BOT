@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from decimal import Decimal
 
 import httpx
@@ -96,6 +97,76 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
     fresh.sort(key=lambda t: (int(t.get("blockNumber", 0) or 0),
                               int(t.get("transactionIndex", 0) or 0)))
     return fresh
+
+
+async def fetch_recent(chain: str, address: str, limit: int = 10) -> list[dict]:
+    """Fetch the latest transactions (native + token) for an address, newest first."""
+    common = {
+        "module": "account",
+        "startblock": 0,
+        "endblock": 999999999,
+        "page": 1,
+        "offset": limit,
+        "sort": "desc",
+    }
+    async with httpx.AsyncClient() as client:
+        native = await _query(client, chain, {**common, "action": "txlist", "address": address})
+        for r in native:
+            r["_type"] = "native"
+        await asyncio.sleep(REQUEST_GAP)
+        token = await _query(client, chain, {**common, "action": "tokentx", "address": address})
+        for r in token:
+            r["_type"] = "token"
+    merged = native + token
+    merged.sort(key=lambda t: (int(t.get("blockNumber", 0) or 0),
+                               int(t.get("timeStamp", 0) or 0)), reverse=True)
+    return merged[:limit]
+
+
+def _age(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}秒前"
+    if seconds < 3600:
+        return f"{seconds // 60}分钟前"
+    if seconds < 86400:
+        return f"{seconds // 3600}小时前"
+    return f"{seconds // 86400}天前"
+
+
+def format_recent(chain_key: str, address: str, txs: list[dict]) -> str:
+    chain = CHAINS[chain_key]
+    explorer = chain["explorer"]
+    target = address.lower()
+    header = (f"📜 <b>[{chain['name']}]</b> "
+              f"<a href=\"{explorer}/address/{address}\">{_short(target)}</a> "
+              f"近 {len(txs)} 条交易")
+    if not txs:
+        return header + "\n\n(没有查到交易)"
+    now = time.time()
+    lines = []
+    for tx in txs:
+        sender = (tx.get("from") or "").lower()
+        receiver = (tx.get("to") or "").lower()
+        if receiver == target and sender != target:
+            arrow = "📥"
+        elif sender == target and receiver != target:
+            arrow = "📤"
+        else:
+            arrow = "🔁"
+        if tx.get("_type") == "token":
+            symbol = html.escape(tx.get("tokenSymbol") or "TOKEN")
+            amount = f"{_amount(tx.get('value', '0'), int(tx.get('tokenDecimal') or 18))} {symbol}"
+        else:
+            amount = f"{_amount(tx.get('value', '0'), 18)} {chain['native']}"
+            if tx.get("isError") == "1":
+                arrow += "⚠️"
+        ts = int(tx.get("timeStamp", 0) or 0)
+        age = _age(now - ts) if ts else "?"
+        lines.append(
+            f"{arrow} <b>{amount}</b> · {_short(sender)} → {_short(receiver)}"
+            f" · {age} · <a href=\"{explorer}/tx/{tx.get('hash', '')}\">查看</a>")
+    return header + "\n\n" + "\n".join(lines)
 
 
 def _short(addr: str) -> str:
