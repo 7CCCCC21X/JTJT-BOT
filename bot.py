@@ -84,6 +84,15 @@ RECENT_PROMPT = ("📝 回复这条消息,发送要查询的地址(0x 开头),"
 store = Store()
 
 STATS = {"started": time.time(), "last_poll": 0.0, "polls": 0, "alerts": 0, "errors": 0}
+LAST_ERRORS: list[tuple[float, str, str]] = []  # (time, watch desc, error)
+_fail_streaks: dict[tuple, int] = {}
+FAIL_ALERT_AT = 5  # 同一监控连续失败这么多轮后,主动提醒一次
+
+
+def _record_error(watch, err: Exception):
+    desc = f"[{CHAINS[watch.chain]['name']}] {watch.label or watch.address[:10] + '…'}"
+    LAST_ERRORS.append((time.time(), desc, str(err)[:180]))
+    del LAST_ERRORS[:-3]
 
 HELP = f"""🤖 <b>链上监控机器人</b>
 
@@ -232,7 +241,7 @@ def status_text(chat_id: int) -> str:
         last = "尚未执行"
     mine = store.for_chat(chat_id)
     chains_used = sorted({CHAINS[w.chain]["name"] for w in mine})
-    return (f"📊 <b>运行状态</b>\n\n"
+    text = (f"📊 <b>运行状态</b>\n\n"
             f"⏱ 运行时长: {uptime}\n"
             f"🔄 轮询间隔: {POLL_INTERVAL} 秒\n"
             f"🕐 上次轮询: {last}(累计 {STATS['polls']} 次)\n"
@@ -241,6 +250,16 @@ def status_text(chat_id: int) -> str:
             f"👀 本会话监控数: {len(mine)}"
             + (f"({'、'.join(chains_used)})" if chains_used else "")
             + f"\n🌐 全局监控数: {len(store.watches)}")
+    if LAST_ERRORS:
+        import html as _html
+        lines = []
+        for ts, desc, err in reversed(LAST_ERRORS):
+            ago = int(time.time() - ts)
+            ago_txt = f"{ago}秒前" if ago < 3600 else f"{ago // 3600}小时前"
+            lines.append(f"• {ago_txt} {_html.escape(desc)}\n"
+                         f"  <code>{_html.escape(err)}</code>")
+        text += "\n\n🧯 <b>最近错误</b>:\n" + "\n".join(lines)
+    return text
 
 
 async def run_test(chat_id: int, bot) -> None:
@@ -768,9 +787,24 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
         for watch in list(store.watches.values()):
             try:
                 txs = await monitor.fetch_new_txs(client, watch)
+                _fail_streaks.pop(watch.key, None)
             except Exception as e:
                 STATS["errors"] += 1
+                _record_error(watch, e)
                 log.warning("poll failed for %s/%s: %s", watch.chain, watch.address, e)
+                streak = _fail_streaks.get(watch.key, 0) + 1
+                _fail_streaks[watch.key] = streak
+                if streak == FAIL_ALERT_AT:
+                    try:
+                        await context.bot.send_message(
+                            watch.chat_id,
+                            f"⚠️ 监控 [{CHAINS[watch.chain]['name']}] "
+                            f"<code>{watch.address}</code> 已连续 {streak} 轮失败:\n"
+                            f"<code>{str(e)[:300]}</code>\n"
+                            "修复前该监控不会推送新交易,详情见 /status。",
+                            parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
                 continue
             if txs:
                 dirty = True

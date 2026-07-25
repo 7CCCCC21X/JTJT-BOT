@@ -80,10 +80,56 @@ async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[di
             else:
                 raise
     if chain in BLOCKSCOUT_URLS:
+        # Blockscout 的 tokentx 需要 address 参数;只有 contractaddress 时
+        # (代币合约监控)改走它的 v2 接口查该代币的全部转账
+        if (params.get("action") == "tokentx"
+                and "contractaddress" in params and "address" not in params):
+            return await _blockscout_token_transfers(client, chain, params)
         data = await _get_json(client, BLOCKSCOUT_URLS[chain], dict(params))
         return _parse_list(data)
     raise EtherscanError(
         f"{CHAINS[chain]['name']} 不在 Etherscan 免费套餐内,且暂无备用数据源")
+
+
+def _adapt_v2_transfer(item: dict) -> dict:
+    """把 Blockscout v2 transfer 条目转成 etherscan tokentx 行格式。"""
+    total = item.get("total") or {}
+    token = item.get("token") or {}
+    ts = 0
+    raw_ts = item.get("timestamp")
+    if raw_ts:
+        from datetime import datetime
+        try:
+            ts = int(datetime.fromisoformat(
+                str(raw_ts).replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+    return {
+        "hash": item.get("transaction_hash") or item.get("tx_hash") or "",
+        "blockNumber": str(item.get("block_number") or 0),
+        "timeStamp": str(ts),
+        "from": (item.get("from") or {}).get("hash", ""),
+        "to": (item.get("to") or {}).get("hash", ""),
+        "value": str(total.get("value") or "0"),
+        "tokenSymbol": token.get("symbol") or "",
+        "tokenDecimal": str(total.get("decimals")
+                            or token.get("decimals") or 18),
+        "logIndex": str(item.get("log_index") or ""),
+        "transactionIndex": "0",
+    }
+
+
+async def _blockscout_token_transfers(client: httpx.AsyncClient, chain: str,
+                                      params: dict) -> list[dict]:
+    base_url = BLOCKSCOUT_URLS[chain].rsplit("/api", 1)[0]
+    url = f"{base_url}/api/v2/tokens/{params['contractaddress']}/transfers"
+    data = await _get_json(client, url, {})
+    items = data.get("items") or []
+    rows = [_adapt_v2_transfer(i) for i in items]
+    start = int(params.get("startblock", 0) or 0)
+    rows = [r for r in rows if int(r["blockNumber"] or 0) >= start]
+    limit = int(params.get("offset", 50) or 50)
+    return rows[:limit]  # v2 默认新→旧排序,取最新的一页
 
 
 async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
