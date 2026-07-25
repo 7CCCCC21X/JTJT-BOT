@@ -26,15 +26,29 @@ class EtherscanError(Exception):
     pass
 
 
-async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[dict]:
-    q = {
-        "chainid": CHAINS[chain]["chain_id"],
-        "apikey": API_KEY,
-        **params,
-    }
-    resp = await client.get(API_URL, params=q, timeout=30)
+# Etherscan 免费套餐不覆盖的链自动降级到 Blockscout(免费、无需 key、接口兼容)
+BLOCKSCOUT_URLS = {
+    "eth": "https://eth.blockscout.com/api",
+    "base": "https://base.blockscout.com/api",
+    "arb": "https://arbitrum.blockscout.com/api",
+    "polygon": "https://polygon.blockscout.com/api",
+}
+_fallback_chains: set[str] = set()
+
+
+def _plan_blocked(text) -> bool:
+    t = str(text).lower()
+    return ("not supported for this chain" in t
+            or "upgrade your api plan" in t)
+
+
+async def _get_json(client: httpx.AsyncClient, url: str, params: dict) -> dict:
+    resp = await client.get(url, params=params, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
+    return resp.json()
+
+
+def _parse_list(data: dict) -> list[dict]:
     if data.get("status") == "1":
         return data.get("result") or []
     message = str(data.get("message", ""))
@@ -47,6 +61,29 @@ async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[di
             "ETHERSCAN_API_KEY 换成 etherscan.io/myapikey 申请的 key"
             "(V2 多链通用,BscScan 旧 key 不可用)")
     raise EtherscanError(f"{message}: {result}")
+
+
+async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[dict]:
+    if chain not in _fallback_chains:
+        data = await _get_json(client, API_URL, {
+            "chainid": CHAINS[chain]["chain_id"],
+            "apikey": API_KEY,
+            **params,
+        })
+        try:
+            return _parse_list(data)
+        except EtherscanError as e:
+            if _plan_blocked(e) and chain in BLOCKSCOUT_URLS:
+                _fallback_chains.add(chain)
+                log.info("chain %s not in Etherscan free plan, "
+                         "switching to Blockscout", chain)
+            else:
+                raise
+    if chain in BLOCKSCOUT_URLS:
+        data = await _get_json(client, BLOCKSCOUT_URLS[chain], dict(params))
+        return _parse_list(data)
+    raise EtherscanError(
+        f"{CHAINS[chain]['name']} 不在 Etherscan 免费套餐内,且暂无备用数据源")
 
 
 async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
@@ -104,19 +141,36 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
     return fresh
 
 
-async def _proxy(client: httpx.AsyncClient, chain: str, action: str, address: str):
-    """Etherscan proxy 模块 (JSON-RPC 透传),返回 result 原文。"""
-    q = {
-        "chainid": CHAINS[chain]["chain_id"],
-        "apikey": API_KEY,
-        "module": "proxy",
-        "action": action,
-        "address": address,
-        "tag": "latest",
-    }
-    resp = await client.get(API_URL, params=q, timeout=15)
-    resp.raise_for_status()
-    return resp.json().get("result")
+async def _proxy(client: httpx.AsyncClient, chain: str, action: str,
+                 extra: dict | None = None):
+    """proxy 模块 (JSON-RPC 透传),返回 result 原文;免费套餐不覆盖时走 Blockscout。"""
+    params = {"module": "proxy", "action": action, **(extra or {})}
+    if chain not in _fallback_chains:
+        data = await _get_json(client, API_URL, {
+            "chainid": CHAINS[chain]["chain_id"],
+            "apikey": API_KEY,
+            **params,
+        })
+        result = data.get("result")
+        if not (_plan_blocked(result) or _plan_blocked(data.get("message", ""))):
+            return result
+        if chain in BLOCKSCOUT_URLS:
+            _fallback_chains.add(chain)
+            log.info("chain %s not in Etherscan free plan, "
+                     "switching to Blockscout", chain)
+        else:
+            return result
+    data = await _get_json(client, BLOCKSCOUT_URLS[chain], params)
+    return data.get("result")
+
+
+async def check_chain(chain: str) -> tuple[int, str]:
+    """连通性检测:返回 (最新区块, 数据源名)。失败抛异常。"""
+    async with httpx.AsyncClient() as client:
+        res = await _proxy(client, chain, "eth_blockNumber")
+    block = int(str(res), 16)  # 出错时 res 是错误文本,这里会抛 ValueError
+    source = "Blockscout" if chain in _fallback_chains else "Etherscan"
+    return block, source
 
 
 async def detect_address(address: str) -> dict[str, dict]:
@@ -129,7 +183,8 @@ async def detect_address(address: str) -> dict[str, dict]:
         for chain in CHAINS:
             info = {"type": "eoa", "symbol": None}
             try:
-                code = await _proxy(client, chain, "eth_getCode", address)
+                code = await _proxy(client, chain, "eth_getCode",
+                                    {"address": address, "tag": "latest"})
                 if isinstance(code, str) and code.startswith("0x") and len(code) > 4:
                     info["type"] = "contract"
                     await asyncio.sleep(REQUEST_GAP)

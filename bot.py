@@ -258,23 +258,16 @@ async def run_test(chat_id: int, bot) -> None:
                            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     lines = ["🌐 <b>API 连通性检测</b>\n"]
-    async with httpx.AsyncClient() as client:
-        for key in ("eth", "bsc", "base"):
-            c = CHAINS[key]
-            data = {}
-            try:
-                r = await client.get(monitor.API_URL, params={
-                    "chainid": c["chain_id"], "module": "proxy",
-                    "action": "eth_blockNumber", "apikey": monitor.API_KEY,
-                }, timeout=15)
-                data = r.json()
-                block = int(str(data.get("result", "")), 16)
-                lines.append(f"✅ {c['name']}: 最新区块 {block:,}")
-            except (ValueError, TypeError):
-                lines.append(f"❌ {c['name']}: {data.get('result') or data.get('message', '响应异常')}")
-            except Exception as e:
-                lines.append(f"❌ {c['name']}: {e}")
-            await asyncio.sleep(monitor.REQUEST_GAP)
+    for key in ("eth", "bsc", "base"):
+        c = CHAINS[key]
+        try:
+            block, source = await monitor.check_chain(key)
+            lines.append(f"✅ {c['name']}: 最新区块 {block:,}(数据源 {source})")
+        except ValueError:
+            lines.append(f"❌ {c['name']}: API 返回异常,检查 ETHERSCAN_API_KEY")
+        except Exception as e:
+            lines.append(f"❌ {c['name']}: {e}")
+        await asyncio.sleep(monitor.REQUEST_GAP)
     await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
