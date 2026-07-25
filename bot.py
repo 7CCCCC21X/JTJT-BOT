@@ -8,14 +8,23 @@ import asyncio
 import logging
 import os
 import re
+import time
 
 import httpx
-from telegram import Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import monitor
@@ -39,20 +48,26 @@ ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 store = Store()
 
+STATS = {"started": time.time(), "last_poll": 0.0, "polls": 0, "alerts": 0, "errors": 0}
+
 HELP = f"""🤖 <b>链上监控机器人</b>
 
-<b>命令:</b>
+直接发送一个 <code>0x...</code> 地址即可开始添加,或用命令:
+
+/menu — 打开按钮菜单
 /add &lt;地址&gt; [链] [备注] — 监控地址的转入/转出(原生币+代币)
 /addtoken &lt;合约&gt; [链] [备注] — 监控代币合约的<b>所有</b>转账
 /label &lt;地址&gt; [链] &lt;备注&gt; — 修改已监控地址的备注
 /remove &lt;地址&gt; [链] — 取消监控
 /list — 查看当前监控列表
+/status — 查看运行状态
+/test — 发送示例推送并检测 API 连通性
 /chains — 支持的链
 /id — 显示当前 chat id
+/cancel — 取消当前添加流程
 
 <b>示例:</b>
 <code>/add 0xEe7b429ea01f76102f053213463d4e95d5d24ae8 bsc 部署者</code>
-<code>/addtoken 0x53f39e5C53EE40bbc3Da97C3B47BD2968d110a8D eth ALIGN</code>
 
 默认链: {DEFAULT_CHAIN},轮询间隔: {POLL_INTERVAL} 秒"""
 
@@ -61,54 +76,50 @@ def _authorized(chat_id: int) -> bool:
     return not ALLOWED_CHAT_IDS or chat_id in ALLOWED_CHAT_IDS
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update.effective_chat.id):
-        return
-    await update.message.reply_text(HELP, parse_mode=ParseMode.HTML)
+# ---------- 卡片键盘 ----------
+
+def menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ 监控地址", callback_data="menu:add_addr"),
+         InlineKeyboardButton("🪙 监控代币", callback_data="menu:add_token")],
+        [InlineKeyboardButton("📋 监控列表", callback_data="menu:list"),
+         InlineKeyboardButton("📊 运行状态", callback_data="menu:status")],
+        [InlineKeyboardButton("🧪 测试推送", callback_data="menu:test"),
+         InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
+    ])
 
 
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"chat id: <code>{update.effective_chat.id}</code>",
-                                    parse_mode=ParseMode.HTML)
+def kind_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 地址监控(转入/转出)", callback_data="kind:address")],
+        [InlineKeyboardButton("🪙 代币监控(该代币全部转账)", callback_data="kind:token")],
+        [InlineKeyboardButton("❌ 取消", callback_data="cancel")],
+    ])
 
 
-async def cmd_chains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update.effective_chat.id):
-        return
-    lines = [f"• <code>{key}</code> — {c['name']} (chainid {c['chain_id']})"
-             for key, c in CHAINS.items()]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+def chain_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⟠ Ethereum", callback_data="chain:eth"),
+         InlineKeyboardButton("🟡 BNB Chain", callback_data="chain:bsc")],
+        [InlineKeyboardButton("🔵 Base", callback_data="chain:base"),
+         InlineKeyboardButton("🔷 Arbitrum", callback_data="chain:arb")],
+        [InlineKeyboardButton("🟣 Polygon", callback_data="chain:polygon"),
+         InlineKeyboardButton("❌ 取消", callback_data="cancel")],
+    ])
 
 
-def _parse_add_args(args: list[str]) -> tuple[str, str, str] | str:
-    """Return (address, chain, label) or an error message."""
-    if not args:
-        return "用法: /add <地址> [链] [备注]"
-    address = args[0]
-    if not ADDR_RE.match(address):
-        return "❌ 地址格式不对,应为 0x 开头的 40 位十六进制。"
-    chain = DEFAULT_CHAIN
-    label_parts = args[1:]
-    if label_parts:
-        maybe = resolve_chain(label_parts[0])
-        if maybe:
-            chain = maybe
-            label_parts = label_parts[1:]
-    return address, chain, " ".join(label_parts)[:40]
+def label_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ 跳过备注", callback_data="label:skip"),
+         InlineKeyboardButton("❌ 取消", callback_data="cancel")],
+    ])
 
 
-async def _add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
-    chat_id = update.effective_chat.id
-    if not _authorized(chat_id):
-        return
-    parsed = _parse_add_args(list(context.args))
-    if isinstance(parsed, str):
-        await update.message.reply_text(parsed)
-        return
-    address, chain, label = parsed
+# ---------- 核心逻辑 ----------
+
+async def create_watch(chat_id: int, address: str, chain: str, kind: str, label: str) -> str:
+    """添加一条监控并返回确认消息 (HTML)。以链上最新一笔为基准,不推历史。"""
     watch = Watch(chat_id, chain, address, kind, label)
-
-    # baseline: start from the current chain tip so history doesn't flood the chat
     try:
         async with httpx.AsyncClient() as client:
             rows = await monitor._query(client, chain, {
@@ -125,46 +136,174 @@ async def _add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: s
         log.warning("baseline fetch failed: %s", e)
 
     if not store.add(watch):
-        await update.message.reply_text("已在监控列表里了。")
-        return
+        return "已在监控列表里了。"
     kind_txt = "代币合约(全部转账)" if kind == "token" else "地址"
     explorer = CHAINS[chain]["explorer"]
-    await update.message.reply_text(
-        f"✅ 已开始监控{kind_txt}\n"
-        f"<a href=\"{explorer}/address/{address}\">{address}</a>\n"
-        f"链: {CHAINS[chain]['name']}"
-        + (f"\n备注: {label}" if label else ""),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    return (f"✅ 已开始监控{kind_txt}\n"
+            f"<a href=\"{explorer}/address/{address}\">{address}</a>\n"
+            f"链: {CHAINS[chain]['name']}"
+            + (f"\n备注: {label}" if label else ""))
 
 
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _add_watch(update, context, "address")
+def list_text(chat_id: int) -> str:
+    watches = store.for_chat(chat_id)
+    if not watches:
+        return "当前没有监控。发送一个 0x 地址,或用 /add 添加。"
+    lines = []
+    for w in watches:
+        c = CHAINS[w.chain]
+        kind = "🪙代币" if w.kind == "token" else "👤地址"
+        label = f" ({w.label})" if w.label else ""
+        lines.append(
+            f"{kind} [{c['name']}]{label}\n"
+            f"<a href=\"{c['explorer']}/address/{w.address}\">{w.address}</a>")
+    return "\n\n".join(lines)
 
 
-async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _add_watch(update, context, "token")
+def status_text(chat_id: int) -> str:
+    up = int(time.time() - STATS["started"])
+    days, rem = divmod(up, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    uptime = (f"{days}天 " if days else "") + f"{hours}小时 {minutes}分"
+    if STATS["last_poll"]:
+        ago = int(time.time() - STATS["last_poll"])
+        last = f"{ago} 秒前"
+    else:
+        last = "尚未执行"
+    mine = store.for_chat(chat_id)
+    chains_used = sorted({CHAINS[w.chain]["name"] for w in mine})
+    return (f"📊 <b>运行状态</b>\n\n"
+            f"⏱ 运行时长: {uptime}\n"
+            f"🔄 轮询间隔: {POLL_INTERVAL} 秒\n"
+            f"🕐 上次轮询: {last}(累计 {STATS['polls']} 次)\n"
+            f"📨 已推送提醒: {STATS['alerts']} 条\n"
+            f"⚠️ 轮询错误: {STATS['errors']} 次\n\n"
+            f"👀 本会话监控数: {len(mine)}"
+            + (f"({'、'.join(chains_used)})" if chains_used else "")
+            + f"\n🌐 全局监控数: {len(store.watches)}")
 
 
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def run_test(chat_id: int, bot) -> None:
+    """发送一条示例推送,并检测各链 API 连通性。"""
+    sample = Watch(chat_id, DEFAULT_CHAIN, "0x" + "ee" * 20, "address", "测试地址")
+    sample_tx = {
+        "_type": "token", "hash": "0x" + "ab" * 32,
+        "from": sample.address, "to": "0x" + "46" * 20,
+        "value": "1250000000000000000000",
+        "tokenSymbol": "ALIGN", "tokenDecimal": "18",
+        "blockNumber": "49070475",
+    }
+    await bot.send_message(chat_id, "🧪 示例推送如下:")
+    await bot.send_message(chat_id, monitor.format_tx(sample, sample_tx),
+                           parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+    lines = ["🌐 <b>API 连通性检测</b>\n"]
+    async with httpx.AsyncClient() as client:
+        for key in ("eth", "bsc", "base"):
+            c = CHAINS[key]
+            data = {}
+            try:
+                r = await client.get(monitor.API_URL, params={
+                    "chainid": c["chain_id"], "module": "proxy",
+                    "action": "eth_blockNumber", "apikey": monitor.API_KEY,
+                }, timeout=15)
+                data = r.json()
+                block = int(str(data.get("result", "")), 16)
+                lines.append(f"✅ {c['name']}: 最新区块 {block:,}")
+            except (ValueError, TypeError):
+                lines.append(f"❌ {c['name']}: {data.get('result') or data.get('message', '响应异常')}")
+            except Exception as e:
+                lines.append(f"❌ {c['name']}: {e}")
+            await asyncio.sleep(monitor.REQUEST_GAP)
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------- 命令 ----------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update.effective_chat.id):
+        return
+    await update.message.reply_text(HELP, parse_mode=ParseMode.HTML,
+                                    reply_markup=menu_kb())
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update.effective_chat.id):
+        return
+    await update.message.reply_text("📱 <b>主菜单</b> — 请选择:",
+                                    parse_mode=ParseMode.HTML, reply_markup=menu_kb())
+
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"chat id: <code>{update.effective_chat.id}</code>",
+                                    parse_mode=ParseMode.HTML)
+
+
+async def cmd_chains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update.effective_chat.id):
+        return
+    lines = [f"• <code>{key}</code> — {c['name']} (chainid {c['chain_id']})"
+             for key, c in CHAINS.items()]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update.effective_chat.id):
+        return
+    await update.message.reply_text(status_text(update.effective_chat.id),
+                                    parse_mode=ParseMode.HTML)
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update.effective_chat.id):
+        return
+    await run_test(update.effective_chat.id, context.bot)
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.chat_data.pop("pending", None):
+        await update.message.reply_text("已取消当前添加流程。")
+    else:
+        await update.message.reply_text("当前没有进行中的操作。")
+
+
+def _parse_add_args(args: list[str]) -> tuple[str, str, str] | str:
+    if not args:
+        return "用法: /add <地址> [链] [备注]"
+    address = args[0]
+    if not ADDR_RE.match(address):
+        return "❌ 地址格式不对,应为 0x 开头的 40 位十六进制。"
+    chain = DEFAULT_CHAIN
+    label_parts = args[1:]
+    if label_parts:
+        maybe = resolve_chain(label_parts[0])
+        if maybe:
+            chain = maybe
+            label_parts = label_parts[1:]
+    return address, chain, " ".join(label_parts)[:40]
+
+
+async def _add_by_command(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
     chat_id = update.effective_chat.id
     if not _authorized(chat_id):
         return
-    args = list(context.args)
-    if not args:
-        await update.message.reply_text("用法: /remove <地址> [链]")
+    parsed = _parse_add_args(list(context.args))
+    if isinstance(parsed, str):
+        await update.message.reply_text(parsed)
         return
-    address = args[0]
-    chain = resolve_chain(args[1]) if len(args) > 1 else None
-    if len(args) > 1 and not chain:
-        await update.message.reply_text("❌ 不认识这条链,/chains 查看支持列表。")
-        return
-    removed = 0
-    for c in ([chain] if chain else list(CHAINS)):
-        removed += store.remove(chat_id, c, address)
-    await update.message.reply_text(
-        f"🗑 已移除 {removed} 条监控。" if removed else "没找到对应的监控。")
+    address, chain, label = parsed
+    text = await create_watch(chat_id, address, chain, kind, label)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _add_by_command(update, context, "address")
+
+
+async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _add_by_command(update, context, "token")
 
 
 async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,27 +339,160 @@ async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✏️ 已更新 {len(matched)} 条监控的备注为「{label}」")
 
 
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _authorized(chat_id):
+        return
+    args = list(context.args)
+    if not args:
+        await update.message.reply_text("用法: /remove <地址> [链]")
+        return
+    address = args[0]
+    chain = resolve_chain(args[1]) if len(args) > 1 else None
+    if len(args) > 1 and not chain:
+        await update.message.reply_text("❌ 不认识这条链,/chains 查看支持列表。")
+        return
+    removed = 0
+    for c in ([chain] if chain else list(CHAINS)):
+        removed += store.remove(chat_id, c, address)
+    await update.message.reply_text(
+        f"🗑 已移除 {removed} 条监控。" if removed else "没找到对应的监控。")
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not _authorized(chat_id):
         return
-    watches = store.for_chat(chat_id)
-    if not watches:
-        await update.message.reply_text("当前没有监控,/add 添加一个。")
-        return
-    lines = []
-    for w in watches:
-        c = CHAINS[w.chain]
-        kind = "🪙代币" if w.kind == "token" else "👤地址"
-        label = f" ({w.label})" if w.label else ""
-        lines.append(
-            f"{kind} [{c['name']}]{label}\n"
-            f"<a href=\"{c['explorer']}/address/{w.address}\">{w.address}</a>")
-    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML,
+    await update.message.reply_text(list_text(chat_id), parse_mode=ParseMode.HTML,
                                     disable_web_page_preview=True)
 
 
+# ---------- 卡片流程(回复消息添加) ----------
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理普通文本:进行中的添加流程,或直接发来的 0x 地址。"""
+    chat_id = update.effective_chat.id
+    if not _authorized(chat_id) or not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    pending = context.chat_data.get("pending")
+
+    if pending:
+        step = pending.get("step")
+        if step == "address":
+            if not ADDR_RE.match(text):
+                await update.message.reply_text(
+                    "❌ 地址格式不对,请回复 0x 开头的 40 位地址,或 /cancel 取消。")
+                return
+            pending["address"] = text
+            pending["step"] = "chain"
+            await update.message.reply_text(
+                f"地址: <code>{text}</code>\n请选择所在链:",
+                parse_mode=ParseMode.HTML, reply_markup=chain_kb())
+        elif step == "label":
+            pending["label"] = text[:40]
+            await _finalize_pending(context, chat_id)
+        return
+
+    if ADDR_RE.match(text):
+        context.chat_data["pending"] = {"address": text, "step": "kind"}
+        await update.message.reply_text(
+            f"检测到地址 <code>{text}</code>\n要如何监控?",
+            parse_mode=ParseMode.HTML, reply_markup=kind_kb())
+
+
+async def _finalize_pending(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    pending = context.chat_data.pop("pending", None)
+    if not pending or "address" not in pending or "chain" not in pending:
+        return
+    text = await create_watch(chat_id, pending["address"], pending["chain"],
+                              pending.get("kind", "address"), pending.get("label", ""))
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    chat_id = q.message.chat.id
+    if not _authorized(chat_id):
+        await q.answer()
+        return
+    data = q.data or ""
+    await q.answer()
+
+    if data == "cancel":
+        context.chat_data.pop("pending", None)
+        await q.edit_message_text("已取消。")
+
+    elif data == "menu:add_addr":
+        context.chat_data["pending"] = {"kind": "address", "step": "address"}
+        await q.edit_message_text(
+            "➕ 监控地址(转入/转出)\n\n请直接回复要监控的地址(0x 开头),或 /cancel 取消。")
+
+    elif data == "menu:add_token":
+        context.chat_data["pending"] = {"kind": "token", "step": "address"}
+        await q.edit_message_text(
+            "🪙 监控代币合约(全部转账)\n\n请直接回复代币合约地址(0x 开头),或 /cancel 取消。")
+
+    elif data == "menu:list":
+        await q.edit_message_text(list_text(chat_id), parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True, reply_markup=menu_kb())
+
+    elif data == "menu:status":
+        await q.edit_message_text(status_text(chat_id), parse_mode=ParseMode.HTML,
+                                  reply_markup=menu_kb())
+
+    elif data == "menu:test":
+        await q.edit_message_text("🧪 正在发送测试…")
+        await run_test(chat_id, context.bot)
+
+    elif data == "menu:help":
+        await q.edit_message_text(HELP, parse_mode=ParseMode.HTML,
+                                  reply_markup=menu_kb())
+
+    elif data.startswith("kind:"):
+        pending = context.chat_data.get("pending")
+        if not pending or "address" not in pending:
+            await q.edit_message_text("会话已过期,请重新发送地址。")
+            return
+        pending["kind"] = "token" if data == "kind:token" else "address"
+        pending["step"] = "chain"
+        kind_txt = "代币监控" if pending["kind"] == "token" else "地址监控"
+        await q.edit_message_text(
+            f"{kind_txt}: <code>{pending['address']}</code>\n请选择所在链:",
+            parse_mode=ParseMode.HTML, reply_markup=chain_kb())
+
+    elif data.startswith("chain:"):
+        pending = context.chat_data.get("pending")
+        if not pending or "address" not in pending:
+            await q.edit_message_text("会话已过期,请重新发送地址。")
+            return
+        chain = data.split(":", 1)[1]
+        if chain not in CHAINS:
+            return
+        pending["chain"] = chain
+        pending["step"] = "label"
+        await q.edit_message_text(
+            f"链: {CHAINS[chain]['name']}\n"
+            f"地址: <code>{pending['address']}</code>\n\n"
+            "请直接回复备注文字(如「部署者钱包」),或点击跳过:",
+            parse_mode=ParseMode.HTML, reply_markup=label_kb())
+
+    elif data == "label:skip":
+        pending = context.chat_data.get("pending")
+        if pending is not None:
+            pending["label"] = ""
+        await q.edit_message_text("⏳ 正在添加…")
+        await _finalize_pending(context, chat_id)
+
+
+# ---------- 轮询 ----------
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
+    STATS["polls"] += 1
+    STATS["last_poll"] = time.time()
     if not store.watches:
         return
     dirty = False
@@ -229,6 +501,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 txs = await monitor.fetch_new_txs(client, watch)
             except Exception as e:
+                STATS["errors"] += 1
                 log.warning("poll failed for %s/%s: %s", watch.chain, watch.address, e)
                 continue
             if txs:
@@ -240,6 +513,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
                             watch.chat_id, monitor.format_tx(watch, tx),
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True)
+                        STATS["alerts"] += 1
                     except Exception as e:
                         log.warning("send failed to %s: %s", watch.chat_id, e)
                 if len(txs) > len(shown):
@@ -258,21 +532,44 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
         store.save()
 
 
+async def post_init(app: Application):
+    """注册 Telegram 原生命令菜单(输入框左侧的菜单按钮)。"""
+    await app.bot.set_my_commands([
+        BotCommand("menu", "打开按钮菜单"),
+        BotCommand("add", "监控地址 <地址> [链] [备注]"),
+        BotCommand("addtoken", "监控代币合约 <合约> [链] [备注]"),
+        BotCommand("list", "查看监控列表"),
+        BotCommand("status", "查看运行状态"),
+        BotCommand("test", "测试推送与 API 检测"),
+        BotCommand("label", "修改备注 <地址> [链] <备注>"),
+        BotCommand("remove", "取消监控 <地址> [链]"),
+        BotCommand("chains", "支持的链"),
+        BotCommand("cancel", "取消当前添加流程"),
+        BotCommand("help", "帮助"),
+    ])
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("缺少环境变量 TELEGRAM_BOT_TOKEN")
     if not monitor.API_KEY:
         raise SystemExit("缺少环境变量 ETHERSCAN_API_KEY")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("chains", cmd_chains))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler(["addtoken", "add_token"], cmd_addtoken))
     app.add_handler(CommandHandler(["label", "note"], cmd_label))
     app.add_handler(CommandHandler(["remove", "rm", "del"], cmd_remove))
     app.add_handler(CommandHandler(["list", "ls"], cmd_list))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=5)
 
