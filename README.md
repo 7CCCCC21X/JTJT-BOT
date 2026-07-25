@@ -3,7 +3,7 @@
 监控指定钱包地址的交易(转入/转出、原生币 + 代币),或监控某个代币合约的**所有转账**,有新动作时实时推送到 Telegram。
 
 - 数据源:Etherscan V2 多链 API —— **一个免费 key** 同时支持 Ethereum / BNB Chain / Base / Arbitrum / Polygon
-- Etherscan 免费套餐不覆盖的链(如 Base)会**自动降级到 Blockscout** 免费 API,无需额外配置
+- Etherscan 免费套餐不覆盖的链会**自动降级到备用免费数据源**(每链一组候选:Blockscout、BscScan 等,逐个探测取第一个可用的),也可用 `FALLBACK_API_<链>` 环境变量指定自定义源;`/test` 会显示每条链实际在用的数据源
 - 默认每 30 秒轮询一次
 - 支持多个 chat 各自维护自己的监控列表
 - 专为 Railway 部署设计(Dockerfile + railway.toml,无需开放端口的 worker 进程)

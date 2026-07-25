@@ -26,14 +26,29 @@ class EtherscanError(Exception):
     pass
 
 
-# Etherscan 免费套餐不覆盖的链自动降级到 Blockscout(免费、无需 key、接口兼容)
-BLOCKSCOUT_URLS = {
-    "eth": "https://eth.blockscout.com/api",
-    "base": "https://base.blockscout.com/api",
-    "arb": "https://arbitrum.blockscout.com/api",
-    "polygon": "https://polygon.blockscout.com/api",
+# Etherscan 免费套餐不覆盖的链自动降级到备用数据源。
+# 每条链一组候选 (url, 是否带 apikey),逐个探测,第一个可用的胜出。
+# 可用 FALLBACK_API_<链> 环境变量插队自定义,如 FALLBACK_API_BSC=https://xxx/api
+FALLBACKS: dict[str, list[tuple[str, bool]]] = {
+    "eth": [("https://eth.blockscout.com/api", False)],
+    "bsc": [("https://bsc.blockscout.com/api", False),
+            ("https://api.bscscan.com/api", True),
+            ("https://api.bscscan.com/api", False)],
+    "base": [("https://base.blockscout.com/api", False)],
+    "arb": [("https://arbitrum.blockscout.com/api", False)],
+    "polygon": [("https://polygon.blockscout.com/api", False)],
 }
 _fallback_chains: set[str] = set()
+_fallback_urls: dict[str, tuple[str, bool]] = {}  # 探测成功后缓存
+
+
+def _candidates(chain: str) -> list[tuple[str, bool]]:
+    lst: list[tuple[str, bool]] = []
+    env = os.environ.get(f"FALLBACK_API_{chain.upper()}")
+    if env:
+        lst.append((env.rstrip("/"), False))
+    lst.extend(FALLBACKS.get(chain, []))
+    return lst
 
 
 def _plan_blocked(text) -> bool:
@@ -63,6 +78,41 @@ def _parse_list(data: dict) -> list[dict]:
     raise EtherscanError(f"{message}: {result}")
 
 
+async def _fallback_do(client: httpx.AsyncClient, url: str, with_key: bool,
+                       params: dict) -> list[dict]:
+    p = dict(params)
+    if with_key:
+        p["apikey"] = API_KEY
+    else:
+        p.pop("apikey", None)
+    # Blockscout 的 tokentx 需要 address 参数;只有 contractaddress 时
+    # (代币合约监控)改走它的 v2 接口查该代币的全部转账
+    if ("blockscout" in url and p.get("action") == "tokentx"
+            and "contractaddress" in p and "address" not in p):
+        return await _blockscout_token_transfers(client, url, p)
+    data = await _get_json(client, url, p)
+    return _parse_list(data)
+
+
+async def _fallback_query(client: httpx.AsyncClient, chain: str,
+                          params: dict) -> list[dict]:
+    if chain in _fallback_urls:
+        url, with_key = _fallback_urls[chain]
+        return await _fallback_do(client, url, with_key, params)
+    errors = []
+    for url, with_key in _candidates(chain):
+        try:
+            rows = await _fallback_do(client, url, with_key, params)
+            _fallback_urls[chain] = (url, with_key)
+            log.info("chain %s using fallback source %s", chain, url)
+            return rows
+        except Exception as e:
+            errors.append(f"{url}: {str(e)[:80]}")
+        await asyncio.sleep(REQUEST_GAP)
+    raise EtherscanError(
+        f"{CHAINS[chain]['name']} 的备用数据源均不可用: " + " | ".join(errors))
+
+
 async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[dict]:
     if chain not in _fallback_chains:
         data = await _get_json(client, API_URL, {
@@ -73,20 +123,14 @@ async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[di
         try:
             return _parse_list(data)
         except EtherscanError as e:
-            if _plan_blocked(e) and chain in BLOCKSCOUT_URLS:
+            if _plan_blocked(e) and _candidates(chain):
                 _fallback_chains.add(chain)
                 log.info("chain %s not in Etherscan free plan, "
-                         "switching to Blockscout", chain)
+                         "switching to fallback sources", chain)
             else:
                 raise
-    if chain in BLOCKSCOUT_URLS:
-        # Blockscout 的 tokentx 需要 address 参数;只有 contractaddress 时
-        # (代币合约监控)改走它的 v2 接口查该代币的全部转账
-        if (params.get("action") == "tokentx"
-                and "contractaddress" in params and "address" not in params):
-            return await _blockscout_token_transfers(client, chain, params)
-        data = await _get_json(client, BLOCKSCOUT_URLS[chain], dict(params))
-        return _parse_list(data)
+    if _candidates(chain):
+        return await _fallback_query(client, chain, params)
     raise EtherscanError(
         f"{CHAINS[chain]['name']} 不在 Etherscan 免费套餐内,且暂无备用数据源")
 
@@ -119,9 +163,9 @@ def _adapt_v2_transfer(item: dict) -> dict:
     }
 
 
-async def _blockscout_token_transfers(client: httpx.AsyncClient, chain: str,
+async def _blockscout_token_transfers(client: httpx.AsyncClient, api_url: str,
                                       params: dict) -> list[dict]:
-    base_url = BLOCKSCOUT_URLS[chain].rsplit("/api", 1)[0]
+    base_url = api_url.rsplit("/api", 1)[0]
     url = f"{base_url}/api/v2/tokens/{params['contractaddress']}/transfers"
     data = await _get_json(client, url, {})
     items = data.get("items") or []
@@ -189,7 +233,7 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
 
 async def _proxy(client: httpx.AsyncClient, chain: str, action: str,
                  extra: dict | None = None):
-    """proxy 模块 (JSON-RPC 透传),返回 result 原文;免费套餐不覆盖时走 Blockscout。"""
+    """proxy 模块 (JSON-RPC 透传),返回 result 原文;免费套餐不覆盖时走备用源。"""
     params = {"module": "proxy", "action": action, **(extra or {})}
     if chain not in _fallback_chains:
         data = await _get_json(client, API_URL, {
@@ -200,23 +244,46 @@ async def _proxy(client: httpx.AsyncClient, chain: str, action: str,
         result = data.get("result")
         if not (_plan_blocked(result) or _plan_blocked(data.get("message", ""))):
             return result
-        if chain in BLOCKSCOUT_URLS:
+        if _candidates(chain):
             _fallback_chains.add(chain)
             log.info("chain %s not in Etherscan free plan, "
-                     "switching to Blockscout", chain)
+                     "switching to fallback sources", chain)
         else:
             return result
-    data = await _get_json(client, BLOCKSCOUT_URLS[chain], params)
-    return data.get("result")
+    # 已探测出的源优先,否则依次尝试候选
+    tried = ([_fallback_urls[chain]] if chain in _fallback_urls else []) \
+        + [c for c in _candidates(chain)
+           if c != _fallback_urls.get(chain)]
+    for url, with_key in tried:
+        p = dict(params)
+        if with_key:
+            p["apikey"] = API_KEY
+        try:
+            data = await _get_json(client, url, p)
+            res = data.get("result")
+            if isinstance(res, str) and res.startswith("0x"):
+                return res
+        except Exception as e:
+            log.debug("proxy fallback %s failed: %s", url, e)
+        await asyncio.sleep(REQUEST_GAP)
+    return None
+
+
+def _source_name(chain: str) -> str:
+    if chain not in _fallback_chains:
+        return "Etherscan"
+    if chain in _fallback_urls:
+        from urllib.parse import urlparse
+        return urlparse(_fallback_urls[chain][0]).netloc
+    return "备用源"
 
 
 async def check_chain(chain: str) -> tuple[int, str]:
     """连通性检测:返回 (最新区块, 数据源名)。失败抛异常。"""
     async with httpx.AsyncClient() as client:
         res = await _proxy(client, chain, "eth_blockNumber")
-    block = int(str(res), 16)  # 出错时 res 是错误文本,这里会抛 ValueError
-    source = "Blockscout" if chain in _fallback_chains else "Etherscan"
-    return block, source
+    block = int(str(res), 16)  # 出错时 res 是错误文本/None,这里会抛异常
+    return block, _source_name(chain)
 
 
 async def detect_address(address: str) -> dict[str, dict]:
