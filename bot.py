@@ -44,6 +44,7 @@ HELP = f"""🤖 <b>链上监控机器人</b>
 <b>命令:</b>
 /add &lt;地址&gt; [链] [备注] — 监控地址的转入/转出(原生币+代币)
 /addtoken &lt;合约&gt; [链] [备注] — 监控代币合约的<b>所有</b>转账
+/label &lt;地址&gt; [链] &lt;备注&gt; — 修改已监控地址的备注
 /remove &lt;地址&gt; [链] — 取消监控
 /list — 查看当前监控列表
 /chains — 支持的链
@@ -166,6 +167,39 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🗑 已移除 {removed} 条监控。" if removed else "没找到对应的监控。")
 
 
+async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _authorized(chat_id):
+        return
+    args = list(context.args)
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法: /label <地址> [链] <备注>\n"
+            "例: /label 0xEe7b...4ae8 bsc 部署者钱包")
+        return
+    address = args[0]
+    if not ADDR_RE.match(address):
+        await update.message.reply_text("❌ 地址格式不对,应为 0x 开头的 40 位十六进制。")
+        return
+    rest = args[1:]
+    chain = resolve_chain(rest[0]) if resolve_chain(rest[0]) else None
+    if chain and len(rest) > 1:
+        rest = rest[1:]
+    else:
+        chain = None
+    label = " ".join(rest)[:40]
+    matched = [w for w in store.for_chat(chat_id)
+               if w.address == address.lower() and (chain is None or w.chain == chain)]
+    if not matched:
+        await update.message.reply_text("没找到对应的监控,先用 /add 或 /addtoken 添加。")
+        return
+    for w in matched:
+        w.label = label
+    store.save()
+    await update.message.reply_text(
+        f"✏️ 已更新 {len(matched)} 条监控的备注为「{label}」")
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not _authorized(chat_id):
@@ -236,6 +270,7 @@ def main():
     app.add_handler(CommandHandler("chains", cmd_chains))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler(["addtoken", "add_token"], cmd_addtoken))
+    app.add_handler(CommandHandler(["label", "note"], cmd_label))
     app.add_handler(CommandHandler(["remove", "rm", "del"], cmd_remove))
     app.add_handler(CommandHandler(["list", "ls"], cmd_list))
 
