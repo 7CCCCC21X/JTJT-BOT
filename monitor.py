@@ -27,28 +27,139 @@ class EtherscanError(Exception):
 
 
 # Etherscan 免费套餐不覆盖的链自动降级到备用数据源。
-# 每条链一组候选 (url, 是否带 apikey),逐个探测,第一个可用的胜出。
-# 可用 FALLBACK_API_<链> 环境变量插队自定义,如 FALLBACK_API_BSC=https://xxx/api
-FALLBACKS: dict[str, list[tuple[str, bool]]] = {
-    "eth": [("https://eth.blockscout.com/api", False)],
-    "bsc": [("https://bsc.blockscout.com/api", False),
-            ("https://api.bscscan.com/api", True),
-            ("https://api.bscscan.com/api", False)],
-    "base": [("https://base.blockscout.com/api", False)],
-    "arb": [("https://arbitrum.blockscout.com/api", False)],
-    "polygon": [("https://polygon.blockscout.com/api", False)],
+# 候选类型: "scan" = etherscan/blockscout 风格 GET 接口; "rpc" = 公共 JSON-RPC 节点
+# (rpc 源用 eth_getLogs 监听代币 Transfer 事件,无法查询原生币普通交易)。
+# 逐个探测,第一个可用的胜出并缓存。可用 FALLBACK_API_<链> 环境变量插队自定义:
+#   FALLBACK_API_BSC=https://xxx/api          (scan 风格)
+#   FALLBACK_API_BSC=rpc:https://xxx-rpc.com  (RPC 节点)
+FALLBACKS: dict[str, list[tuple[str, str, bool]]] = {
+    "eth": [("scan", "https://eth.blockscout.com/api", False),
+            ("rpc", "https://ethereum-rpc.publicnode.com", False)],
+    "bsc": [("rpc", "https://bsc-dataseed.bnbchain.org", False),
+            ("rpc", "https://bsc-dataseed1.bnbchain.org", False),
+            ("rpc", "https://bsc-rpc.publicnode.com", False)],
+    "base": [("scan", "https://base.blockscout.com/api", False),
+             ("rpc", "https://mainnet.base.org", False)],
+    "arb": [("scan", "https://arbitrum.blockscout.com/api", False),
+            ("rpc", "https://arb1.arbitrum.io/rpc", False)],
+    "polygon": [("scan", "https://polygon.blockscout.com/api", False),
+                ("rpc", "https://polygon-rpc.com", False)],
 }
 _fallback_chains: set[str] = set()
-_fallback_urls: dict[str, tuple[str, bool]] = {}  # 探测成功后缓存
+_fallback_urls: dict[str, tuple[str, str, bool]] = {}  # 探测成功后缓存
+
+TRANSFER_TOPIC = ("0xddf252ad1be2c89b69c2b068"
+                  "fc378daa952ba7f163c4a11628f55a4df523b3ef")
+RPC_LOG_SPAN = int(os.environ.get("RPC_LOG_SPAN", "2000"))  # getLogs 最大回看区块数
 
 
-def _candidates(chain: str) -> list[tuple[str, bool]]:
-    lst: list[tuple[str, bool]] = []
+def _candidates(chain: str) -> list[tuple[str, str, bool]]:
+    lst: list[tuple[str, str, bool]] = []
     env = os.environ.get(f"FALLBACK_API_{chain.upper()}")
     if env:
-        lst.append((env.rstrip("/"), False))
+        env = env.strip()
+        if env.startswith("rpc:"):
+            lst.append(("rpc", env[4:].rstrip("/"), False))
+        else:
+            lst.append(("scan", env.rstrip("/"), False))
     lst.extend(FALLBACKS.get(chain, []))
     return lst
+
+
+async def _rpc_call(client: httpx.AsyncClient, url: str, method: str, params: list):
+    resp = await client.post(url, json={
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    }, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error"):
+        raise EtherscanError(f"RPC {method}: {data['error'].get('message', 'error')}")
+    return data.get("result")
+
+
+_token_meta: dict[tuple, tuple[str, int]] = {}  # (rpc_url, contract) -> (symbol, decimals)
+
+
+async def _token_info(client: httpx.AsyncClient, url: str, contract: str) -> tuple[str, int]:
+    key = (url, contract.lower())
+    if key in _token_meta:
+        return _token_meta[key]
+    symbol, decimals = "TOKEN", 18
+    try:  # decimals()
+        res = await _rpc_call(client, url, "eth_call",
+                              [{"to": contract, "data": "0x313ce567"}, "latest"])
+        if res and res not in ("0x", "0x0"):
+            decimals = int(res, 16)
+    except Exception:
+        pass
+    try:  # symbol(),兼容 string 和 bytes32 两种返回
+        res = await _rpc_call(client, url, "eth_call",
+                              [{"to": contract, "data": "0x95d89b41"}, "latest"])
+        if res and res != "0x":
+            raw = bytes.fromhex(res[2:])
+            if len(raw) >= 64:
+                length = int.from_bytes(raw[32:64], "big")
+                text = raw[64:64 + length].decode("utf-8", "ignore")
+            else:
+                text = raw.rstrip(b"\x00").decode("utf-8", "ignore")
+            symbol = text.strip() or "TOKEN"
+    except Exception:
+        pass
+    _token_meta[key] = (symbol, decimals)
+    return symbol, decimals
+
+
+async def _rpc_tokentx(client: httpx.AsyncClient, url: str, params: dict) -> list[dict]:
+    """用 eth_getLogs 拉取 ERC-20 Transfer 事件,适配成 tokentx 行格式。"""
+    latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
+    start = int(params.get("startblock", 0) or 0)
+    if start <= 0 or latest - start > RPC_LOG_SPAN:
+        start = max(latest - RPC_LOG_SPAN, 0)
+    frm, to = hex(start), hex(latest)
+    filters = []
+    if "contractaddress" in params and "address" not in params:
+        filters.append({"address": params["contractaddress"],
+                        "topics": [TRANSFER_TOPIC],
+                        "fromBlock": frm, "toBlock": to})
+    else:
+        padded = "0x" + params["address"].lower().replace("0x", "").rjust(64, "0")
+        filters.append({"topics": [TRANSFER_TOPIC, padded],
+                        "fromBlock": frm, "toBlock": to})
+        filters.append({"topics": [TRANSFER_TOPIC, None, padded],
+                        "fromBlock": frm, "toBlock": to})
+    logs = []
+    for f in filters:
+        logs.extend(await _rpc_call(client, url, "eth_getLogs", [f]) or [])
+        await asyncio.sleep(REQUEST_GAP)
+    rows, seen = [], set()
+    for lg in logs:
+        topics = lg.get("topics") or []
+        if len(topics) != 3:  # 只要 ERC-20(ERC-721 是 4 个 topic)
+            continue
+        k = (lg.get("transactionHash"), lg.get("logIndex"))
+        if k in seen:
+            continue
+        seen.add(k)
+        data_hex = lg.get("data") or "0x0"
+        if data_hex == "0x":
+            data_hex = "0x0"
+        symbol, decimals = await _token_info(client, url, lg.get("address", ""))
+        rows.append({
+            "hash": lg.get("transactionHash", ""),
+            "blockNumber": str(int(str(lg.get("blockNumber", "0x0")), 16)),
+            "timeStamp": "0",
+            "from": "0x" + topics[1][-40:],
+            "to": "0x" + topics[2][-40:],
+            "value": str(int(data_hex, 16)),
+            "tokenSymbol": symbol,
+            "tokenDecimal": str(decimals),
+            "logIndex": str(int(str(lg.get("logIndex", "0x0")), 16)),
+            "transactionIndex": "0",
+        })
+    rows.sort(key=lambda r: int(r["blockNumber"]),
+              reverse=(params.get("sort") == "desc"))
+    limit = int(params.get("offset", 50) or 50)
+    return rows[:limit]
 
 
 def _plan_blocked(text) -> bool:
@@ -78,8 +189,17 @@ def _parse_list(data: dict) -> list[dict]:
     raise EtherscanError(f"{message}: {result}")
 
 
-async def _fallback_do(client: httpx.AsyncClient, url: str, with_key: bool,
+async def _fallback_do(client: httpx.AsyncClient, cand: tuple[str, str, bool],
                        params: dict) -> list[dict]:
+    typ, url, with_key = cand
+    if typ == "rpc":
+        action = params.get("action")
+        if action == "tokentx":
+            return await _rpc_tokentx(client, url, params)
+        if action == "txlist":
+            # RPC 节点没有地址索引,原生币交易查不了;代币转账仍全覆盖
+            return []
+        raise EtherscanError(f"RPC 源不支持 {action}")
     p = dict(params)
     if with_key:
         p["apikey"] = API_KEY
@@ -97,17 +217,16 @@ async def _fallback_do(client: httpx.AsyncClient, url: str, with_key: bool,
 async def _fallback_query(client: httpx.AsyncClient, chain: str,
                           params: dict) -> list[dict]:
     if chain in _fallback_urls:
-        url, with_key = _fallback_urls[chain]
-        return await _fallback_do(client, url, with_key, params)
+        return await _fallback_do(client, _fallback_urls[chain], params)
     errors = []
-    for url, with_key in _candidates(chain):
+    for cand in _candidates(chain):
         try:
-            rows = await _fallback_do(client, url, with_key, params)
-            _fallback_urls[chain] = (url, with_key)
-            log.info("chain %s using fallback source %s", chain, url)
+            rows = await _fallback_do(client, cand, params)
+            _fallback_urls[chain] = cand
+            log.info("chain %s using fallback source %s", chain, cand[1])
             return rows
         except Exception as e:
-            errors.append(f"{url}: {str(e)[:80]}")
+            errors.append(f"{cand[1]}: {str(e)[:80]}")
         await asyncio.sleep(REQUEST_GAP)
     raise EtherscanError(
         f"{CHAINS[chain]['name']} 的备用数据源均不可用: " + " | ".join(errors))
@@ -254,13 +373,23 @@ async def _proxy(client: httpx.AsyncClient, chain: str, action: str,
     tried = ([_fallback_urls[chain]] if chain in _fallback_urls else []) \
         + [c for c in _candidates(chain)
            if c != _fallback_urls.get(chain)]
-    for url, with_key in tried:
-        p = dict(params)
-        if with_key:
-            p["apikey"] = API_KEY
+    extra = extra or {}
+    for typ, url, with_key in tried:
         try:
-            data = await _get_json(client, url, p)
-            res = data.get("result")
+            if typ == "rpc":
+                rpc_args = {
+                    "eth_blockNumber": [],
+                    "eth_getCode": [extra.get("address"), "latest"],
+                }.get(action)
+                if rpc_args is None:
+                    continue
+                res = await _rpc_call(client, url, action, rpc_args)
+            else:
+                p = dict(params)
+                if with_key:
+                    p["apikey"] = API_KEY
+                data = await _get_json(client, url, p)
+                res = data.get("result")
             if isinstance(res, str) and res.startswith("0x"):
                 return res
         except Exception as e:
@@ -274,7 +403,7 @@ def _source_name(chain: str) -> str:
         return "Etherscan"
     if chain in _fallback_urls:
         from urllib.parse import urlparse
-        return urlparse(_fallback_urls[chain][0]).netloc
+        return urlparse(_fallback_urls[chain][1]).netloc
     return "备用源"
 
 
