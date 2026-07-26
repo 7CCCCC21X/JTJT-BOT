@@ -51,6 +51,14 @@ FALLBACKS: dict[str, list[tuple[str, str, bool]]] = {
 }
 _fallback_chains: set[str] = set()
 _fallback_urls: dict[str, tuple[str, str, bool]] = {}  # 探测成功后缓存
+_source_cooldown: dict[tuple, float] = {}  # 被限流的源 -> 冷却到期时间
+COOLDOWN_SECS = int(os.environ.get("SOURCE_COOLDOWN", "300"))
+
+
+def _is_rate_limited(err) -> bool:
+    t = str(err).lower()
+    return ("429" in t or "too many" in t or "usage limit" in t
+            or "rate limit" in t or "quota" in t)
 
 TRANSFER_TOPIC = ("0xddf252ad1be2c89b69c2b068"
                   "fc378daa952ba7f163c4a11628f55a4df523b3ef")
@@ -156,6 +164,8 @@ async def _rpc_tokentx(client: httpx.AsyncClient, url: str, params: dict) -> lis
             logs = collected
             _rpc_spans[url] = span  # 记住该节点实测可用的窗口
         except EtherscanError as e:
+            if _is_rate_limited(e):
+                raise  # 限流类错误,重试只会更糟,交给上层冷却
             # 节点限制范围/结果数时,缩小回看窗口重试
             if ("limit" in str(e).lower() or "range" in str(e).lower()) and span > 50:
                 span = max(span // 4, 50)
@@ -246,31 +256,40 @@ async def _fallback_do(client: httpx.AsyncClient, cand: tuple[str, str, bool],
 
 async def _fallback_query(client: httpx.AsyncClient, chain: str,
                           params: dict) -> list[dict]:
+    import time as _time
+    now = _time.time()
     errors = []
-    failed = None
-    if chain in _fallback_urls:
-        cand = _fallback_urls[chain]
-        try:
-            return await _fallback_do(client, cand, params)
-        except Exception as e:
-            # 缓存的源坏了:剔除并立刻尝试其他候选
-            failed = cand
-            _fallback_urls.pop(chain, None)
-            errors.append(f"{cand[1]}: {str(e)[:120]}")
-            log.warning("fallback source %s failed, re-probing: %s", cand[1], e)
-    for cand in _candidates(chain):
-        if cand == failed:
-            continue
+    tried: list[tuple] = []
+    ordered = ([_fallback_urls[chain]] if chain in _fallback_urls else []) + \
+        [c for c in _candidates(chain) if c != _fallback_urls.get(chain)]
+    # 跳过还在冷却期的源;若全部在冷却,则只温和地试冷却最早到期的那一个,
+    # 避免每轮把所有源轰一遍、让限流计数器永远无法恢复
+    available = [c for c in ordered if _source_cooldown.get(c, 0) <= now]
+    if not available and ordered:
+        available = [min(ordered, key=lambda c: _source_cooldown.get(c, 0))]
+
+    for cand in available:
+        tried.append(cand)
         try:
             rows = await _fallback_do(client, cand, params)
-            _fallback_urls[chain] = cand
-            log.info("chain %s using fallback source %s", chain, cand[1])
+            _source_cooldown.pop(cand, None)
+            if _fallback_urls.get(chain) != cand:
+                _fallback_urls[chain] = cand
+                log.info("chain %s using fallback source %s", chain, cand[1])
             return rows
         except Exception as e:
             errors.append(f"{cand[1]}: {str(e)[:120]}")
+            if _fallback_urls.get(chain) == cand:
+                _fallback_urls.pop(chain, None)
+            if _is_rate_limited(e):
+                _source_cooldown[cand] = _time.time() + COOLDOWN_SECS
+                log.warning("source %s rate-limited, cooling down %ss",
+                            cand[1], COOLDOWN_SECS)
         await asyncio.sleep(REQUEST_GAP)
+    cooling = len(ordered) - len(tried)
+    suffix = f"(另有 {cooling} 个源限流冷却中)" if cooling > 0 else ""
     raise EtherscanError(
-        f"{CHAINS[chain]['name']} 的备用数据源均不可用: " + " | ".join(errors))
+        f"{CHAINS[chain]['name']} 的备用数据源均不可用{suffix}: " + " | ".join(errors))
 
 
 async def _query(client: httpx.AsyncClient, chain: str, params: dict) -> list[dict]:
