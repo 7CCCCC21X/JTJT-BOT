@@ -85,7 +85,10 @@ def _candidates(chain: str) -> list[tuple[str, str, bool]]:
     lst: list[tuple[str, str, bool]] = []
     env = os.environ.get(f"FALLBACK_API_{chain.upper()}")
     if env:
-        lst.append(_classify_env_source(env))
+        # 支持逗号分隔多个源,按顺序排在内置候选之前
+        for part in env.split(","):
+            if part.strip():
+                lst.append(_classify_env_source(part))
     lst.extend(FALLBACKS.get(chain, []))
     return lst
 
