@@ -58,15 +58,26 @@ RPC_LOG_SPAN = int(os.environ.get("RPC_LOG_SPAN", "1000"))  # getLogs 最大回�
 _rpc_spans: dict[str, int] = {}  # 各节点实测可用的回看窗口
 
 
+def _classify_env_source(env: str) -> tuple[str, str, bool]:
+    """解析 FALLBACK_API_<链> 的值,无前缀时自动判断类型。"""
+    env = env.strip()
+    if env.startswith("rpc:"):
+        return ("rpc", env[4:].rstrip("/"), False)
+    if env.startswith("scan:"):
+        return ("scan", env[5:].rstrip("/"), False)
+    url = env.rstrip("/")
+    # etherscan/blockscout 风格的接口都以 /api 结尾;
+    # 其余(nodereal、ankr、drpc 等节点地址)一律按 JSON-RPC 处理
+    if url.endswith("/api"):
+        return ("scan", url, False)
+    return ("rpc", url, False)
+
+
 def _candidates(chain: str) -> list[tuple[str, str, bool]]:
     lst: list[tuple[str, str, bool]] = []
     env = os.environ.get(f"FALLBACK_API_{chain.upper()}")
     if env:
-        env = env.strip()
-        if env.startswith("rpc:"):
-            lst.append(("rpc", env[4:].rstrip("/"), False))
-        else:
-            lst.append(("scan", env.rstrip("/"), False))
+        lst.append(_classify_env_source(env))
     lst.extend(FALLBACKS.get(chain, []))
     return lst
 
