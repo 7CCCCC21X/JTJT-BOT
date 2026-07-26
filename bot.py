@@ -91,7 +91,7 @@ FAIL_ALERT_AT = 5  # 同一监控连续失败这么多轮后,主动提醒一次
 
 def _record_error(watch, err: Exception):
     desc = f"[{CHAINS[watch.chain]['name']}] {watch.label or watch.address[:10] + '…'}"
-    LAST_ERRORS.append((time.time(), desc, str(err)[:180]))
+    LAST_ERRORS.append((time.time(), desc, str(err)[:600]))
     del LAST_ERRORS[:-3]
 
 HELP = f"""🤖 <b>链上监控机器人</b>

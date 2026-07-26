@@ -35,7 +35,11 @@ class EtherscanError(Exception):
 FALLBACKS: dict[str, list[tuple[str, str, bool]]] = {
     "eth": [("scan", "https://eth.blockscout.com/api", False),
             ("rpc", "https://ethereum-rpc.publicnode.com", False)],
-    "bsc": [("rpc", "https://bsc-rpc.publicnode.com", False),
+    "bsc": [("rpc", "https://bsc.drpc.org", False),
+            ("rpc", "https://1rpc.io/bnb", False),
+            ("rpc", "https://bsc.meowrpc.com", False),
+            ("rpc", "https://binance.llamarpc.com", False),
+            ("rpc", "https://bsc-rpc.publicnode.com", False),
             ("rpc", "https://bsc-dataseed.bnbchain.org", False),
             ("rpc", "https://bsc-dataseed1.bnbchain.org", False)],
     "base": [("scan", "https://base.blockscout.com/api", False),
@@ -241,7 +245,7 @@ async def _fallback_query(client: httpx.AsyncClient, chain: str,
             # 缓存的源坏了:剔除并立刻尝试其他候选
             failed = cand
             _fallback_urls.pop(chain, None)
-            errors.append(f"{cand[1]}: {str(e)[:80]}")
+            errors.append(f"{cand[1]}: {str(e)[:120]}")
             log.warning("fallback source %s failed, re-probing: %s", cand[1], e)
     for cand in _candidates(chain):
         if cand == failed:
@@ -252,7 +256,7 @@ async def _fallback_query(client: httpx.AsyncClient, chain: str,
             log.info("chain %s using fallback source %s", chain, cand[1])
             return rows
         except Exception as e:
-            errors.append(f"{cand[1]}: {str(e)[:80]}")
+            errors.append(f"{cand[1]}: {str(e)[:120]}")
         await asyncio.sleep(REQUEST_GAP)
     raise EtherscanError(
         f"{CHAINS[chain]['name']} 的备用数据源均不可用: " + " | ".join(errors))
