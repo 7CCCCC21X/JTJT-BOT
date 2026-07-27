@@ -21,7 +21,8 @@ class Watch:
     """One monitored target for one chat."""
 
     def __init__(self, chat_id: int, chain: str, address: str, kind: str,
-                 label: str = "", last_block: int = 0, seen: list[str] | None = None):
+                 label: str = "", last_block: int = 0, seen: list[str] | None = None,
+                 nonce: int | None = None, balance: str | None = None):
         self.chat_id = chat_id
         self.chain = chain
         self.address = address.lower()
@@ -29,6 +30,8 @@ class Watch:
         self.label = label
         self.last_block = last_block
         self.seen = seen or []  # recent tx keys for dedupe
+        self.nonce = nonce      # RPC 数据源下的活动哨兵:交易计数
+        self.balance = balance  # RPC 数据源下的活动哨兵:原生币余额
 
     @property
     def key(self) -> tuple:
@@ -48,12 +51,15 @@ class Watch:
             "label": self.label,
             "last_block": self.last_block,
             "seen": self.seen[-300:],
+            "nonce": self.nonce,
+            "balance": self.balance,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Watch":
         return cls(d["chat_id"], d["chain"], d["address"], d["kind"],
-                   d.get("label", ""), d.get("last_block", 0), d.get("seen"))
+                   d.get("label", ""), d.get("last_block", 0), d.get("seen"),
+                   d.get("nonce"), d.get("balance"))
 
 
 class Store:

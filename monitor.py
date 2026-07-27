@@ -410,6 +410,16 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
 
     fresh.sort(key=lambda t: (int(t.get("blockNumber", 0) or 0),
                               int(t.get("transactionIndex", 0) or 0)))
+
+    # RPC 数据源查不到普通交易/合约调用,用 nonce+余额哨兵兜底提醒
+    rpc_url = _rpc_source(watch.chain)
+    if watch.kind == "address" and rpc_url:
+        try:
+            notice = await _rpc_activity_probe(client, rpc_url, watch)
+            if notice:
+                fresh.append(notice)
+        except Exception as e:
+            log.debug("activity probe failed for %s: %s", watch.address, e)
     return fresh
 
 
@@ -458,6 +468,47 @@ async def _proxy(client: httpx.AsyncClient, chain: str, action: str,
         except Exception as e:
             log.debug("proxy fallback %s failed: %s", url, e)
         await asyncio.sleep(REQUEST_GAP)
+    return None
+
+
+def _rpc_source(chain: str) -> str | None:
+    """该链当前是否走 RPC 数据源;是则返回节点 URL。"""
+    cand = _fallback_urls.get(chain)
+    if chain in _fallback_chains and cand and cand[0] == "rpc":
+        return cand[1]
+    return None
+
+
+def rpc_limit_note(chain: str) -> str:
+    if _rpc_source(chain):
+        return ("\n\nℹ️ 该链当前使用公共 RPC 数据源,历史查询仅覆盖代币转账事件;"
+                "合约调用和原生币交易请点上方地址到浏览器查看。")
+    return ""
+
+
+async def _rpc_activity_probe(client: httpx.AsyncClient, url: str, watch) -> dict | None:
+    """RPC 链的活动哨兵:nonce 增加 = 发出了新交易(含合约调用),余额变化 = 有收支。"""
+    nonce = int(str(await _rpc_call(
+        client, url, "eth_getTransactionCount", [watch.address, "latest"])), 16)
+    await asyncio.sleep(REQUEST_GAP)
+    balance = int(str(await _rpc_call(
+        client, url, "eth_getBalance", [watch.address, "latest"])), 16)
+    first_run = watch.nonce is None
+    changes = []
+    if not first_run:
+        if nonce > (watch.nonce or 0):
+            changes.append(f"📤 发出了 {nonce - (watch.nonce or 0)} 笔新交易(含合约调用)")
+        old_balance = int(watch.balance or 0)
+        if balance != old_balance:
+            delta = balance - old_balance
+            sign = "+" if delta > 0 else "-"
+            native = CHAINS[watch.chain]["native"]
+            changes.append(f"💰 {native} 余额 {sign}{_amount(str(abs(delta)), 18)}"
+                           f"(现 {_amount(str(balance), 18)} {native})")
+    watch.nonce = nonce
+    watch.balance = str(balance)
+    if changes:
+        return {"_type": "notice", "notice": "\n".join(changes)}
     return None
 
 
@@ -611,6 +662,11 @@ def _amount(raw: str, decimals: int) -> str:
 def format_tx(watch: Watch, tx: dict) -> str:
     chain = CHAINS[watch.chain]
     explorer = chain["explorer"]
+    if tx.get("_type") == "notice":
+        label = html.escape(watch.label or _short(watch.address))
+        return (f"🔔 <b>[{chain['name']}] {label}</b> 检测到链上动作\n"
+                f"{tx.get('notice', '')}\n"
+                f"<a href=\"{explorer}/address/{watch.address}\">🔗 在浏览器查看详情</a>")
     tx_hash = tx.get("hash", "")
     sender = (tx.get("from") or "").lower()
     receiver = (tx.get("to") or "").lower()
