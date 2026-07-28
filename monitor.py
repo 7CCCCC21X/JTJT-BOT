@@ -106,6 +106,52 @@ async def _rpc_call(client: httpx.AsyncClient, url: str, method: str, params: li
 
 _token_meta: dict[tuple, tuple[str, int]] = {}  # (rpc_url, contract) -> (symbol, decimals)
 _enhanced_unsupported: set[str] = set()  # 确认不支持增强接口的节点
+_enhanced_ok: dict[str, bool] = {}       # 增强接口最近一次是否成功(失败时启用哨兵)
+_nr_margins: dict[str, tuple[int, float]] = {}  # url -> (可用边距, 探测时间); -1=暂不可用
+
+
+async def _nr_probe_ok(client, url: str, address: str, to_block: int) -> bool:
+    """探测 NodeReal 索引是否已覆盖 to_block(小范围 from 查询)。"""
+    try:
+        await _rpc_call(client, url, "nr_getTransactionByAddress", [{
+            "category": ["external"], "address": address, "addressType": "from",
+            "order": "desc", "excludeZeroValue": False, "maxCount": "0x1",
+            "fromBlock": hex(max(to_block - 2000, 1)),
+            "toBlock": hex(max(to_block, 1))}])
+        return True
+    except EtherscanError as e:
+        if "not reached" in str(e).lower():
+            return False
+        raise
+
+
+async def _nr_working_margin(client, url: str, address: str, latest: int) -> int | None:
+    """二分定位 NodeReal 索引落后链头多少块,结果缓存 10 分钟。"""
+    import time as _time
+    cached = _nr_margins.get(url)
+    if cached and _time.time() - cached[1] < 600:
+        return None if cached[0] < 0 else cached[0]
+    lo, hi = 0, None
+    for m in (100, 20_000, 100_000, 300_000, 700_000, 1_500_000):
+        if await _nr_probe_ok(client, url, address, latest - m):
+            hi = m
+            break
+        lo = m
+        await asyncio.sleep(REQUEST_GAP)
+    if hi is None:
+        _nr_margins[url] = (-1, _time.time())
+        return None
+    for _ in range(3):  # 细化,减少"跳过头"错过的区块
+        if hi - lo <= 2000:
+            break
+        mid = (lo + hi) // 2
+        await asyncio.sleep(REQUEST_GAP)
+        if await _nr_probe_ok(client, url, address, latest - mid):
+            hi = mid
+        else:
+            lo = mid
+    _nr_margins[url] = (hi, _time.time())
+    return hi
 
 
 def _is_nodereal(url: str) -> bool:
@@ -150,35 +196,40 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
         # 2) fromBlock~toBlock 范围必须小于 2,000,000 个区块
         # 3) 索引落后链头,toBlock 太新会报 "blockNum not reached" → 往回退再试
         latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
-        results = None
-        for margin in (100, 5_000, 50_000):
-            to_block = max(latest - margin, 1)
-            frm_block = min(max(start, to_block - 1_990_000, 1), to_block)
-            base = {
-                "category": ["external"],
-                "address": params.get("address", ""),
-                "fromBlock": hex(frm_block),
-                "toBlock": hex(to_block),
-                "excludeZeroValue": False,
-                "maxCount": hex(limit),
-                "order": "desc" if params.get("sort") == "desc" else "asc",
-            }
-            try:
-                results = []
-                for direction in ("from", "to"):
-                    res = await _rpc_call(client, url, "nr_getTransactionByAddress",
-                                          [{**base, "addressType": direction}])
-                    results.append(res)
-                    await asyncio.sleep(REQUEST_GAP)
-                break
-            except EtherscanError as e:
-                if "not reached" in str(e).lower():
-                    results = None
-                    continue
-                raise
-        if results is None:
-            raise EtherscanError(
-                "nr_getTransactionByAddress: 索引落后过多 (blockNum not reached)")
+        margin = await _nr_working_margin(client, url,
+                                          params.get("address", ""), latest)
+        if margin is None:
+            # 索引落后过多:本轮放弃增强查询,交给哨兵兜底,不报错
+            _enhanced_ok[url] = False
+            log.warning("NodeReal index too far behind on %s, "
+                        "falling back to sentinel mode", url)
+            return []
+        to_block = max(latest - margin, 1)
+        frm_block = min(max(start, to_block - 1_990_000, 1), to_block)
+        base = {
+            "category": ["external"],
+            "address": params.get("address", ""),
+            "fromBlock": hex(frm_block),
+            "toBlock": hex(to_block),
+            "excludeZeroValue": False,
+            "maxCount": hex(limit),
+            "order": "desc" if params.get("sort") == "desc" else "asc",
+        }
+        results = []
+        try:
+            for direction in ("from", "to"):
+                res = await _rpc_call(client, url, "nr_getTransactionByAddress",
+                                      [{**base, "addressType": direction}])
+                results.append(res)
+                await asyncio.sleep(REQUEST_GAP)
+        except EtherscanError as e:
+            if "not reached" in str(e).lower():
+                # 缓存的边距失效(索引回退),下轮重新探测
+                _nr_margins.pop(url, None)
+                _enhanced_ok[url] = False
+                return []
+            raise
+        _enhanced_ok[url] = True
         for res in results:
             for t in (res or {}).get("transfers") or []:
                 key = t.get("uniqueId") or (t.get("hash"), t.get("from"),
@@ -531,8 +582,9 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
 
     # 数据源查不到普通交易/合约调用时(无增强接口的 RPC),用 nonce+余额哨兵兜底
     rpc_url = _rpc_source(watch.chain)
-    if rpc_url and _is_nodereal(rpc_url) and rpc_url not in _enhanced_unsupported:
-        rpc_url = None  # 增强接口已提供完整交易,无需哨兵
+    if (rpc_url and _is_nodereal(rpc_url) and rpc_url not in _enhanced_unsupported
+            and _enhanced_ok.get(rpc_url, False)):
+        rpc_url = None  # 增强接口本轮已提供完整交易,无需哨兵
     if watch.kind == "address" and rpc_url:
         try:
             notice = await _rpc_activity_probe(client, rpc_url, watch)
@@ -623,7 +675,8 @@ def rpc_limit_note(chain: str) -> str:
     url = _rpc_source(chain)
     if not url:
         return ""
-    if _is_nodereal(url) and url not in _enhanced_unsupported:
+    if (_is_nodereal(url) and url not in _enhanced_unsupported
+            and _enhanced_ok.get(url, False)):
         return ""  # NodeReal 增强接口可查全量交易,无需提示
     return ("\n\nℹ️ 该链当前使用公共 RPC 数据源,历史查询仅覆盖代币转账事件;"
             "合约调用和原生币交易请点上方地址到浏览器查看。")
@@ -718,28 +771,47 @@ async def debug_report(chain: str, address: str) -> str:
                 continue
             await asyncio.sleep(REQUEST_GAP)
             if _is_nodereal(url):
-                frm = hex(max(latest - 1_990_000, 1))
-                variants = [
-                    ("from,199万块", {"addressType": "from",
-                                      "fromBlock": frm, "toBlock": hex(latest)}),
-                    ("to,199万块", {"addressType": "to",
-                                    "fromBlock": frm, "toBlock": hex(latest)}),
-                ]
-                for label, extra in variants:
-                    body = {"category": ["external"], "address": address,
-                            "order": "desc", "excludeZeroValue": False,
-                            "maxCount": "0x3", **extra}
+                # 索引进度探测:找出 NodeReal 索引实际推进到哪里
+                async def _nr_probe(frm_b: int, to_b: int, count: str = "0x3"):
+                    resp = await client.post(url, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "nr_getTransactionByAddress",
+                        "params": [{"category": ["external"], "address": address,
+                                    "addressType": "from", "order": "desc",
+                                    "excludeZeroValue": False, "maxCount": count,
+                                    "fromBlock": hex(max(frm_b, 1)),
+                                    "toBlock": hex(max(to_b, 1))}],
+                    }, timeout=30)
+                    return resp.json()
+
+                good_margin = None
+                for margin in (100, 10_000, 100_000, 300_000, 1_000_000):
                     try:
-                        resp = await client.post(url, json={
-                            "jsonrpc": "2.0", "id": 1,
-                            "method": "nr_getTransactionByAddress",
-                            "params": [body],
-                        }, timeout=30)
-                        out.append(f"[{name}] 交易查询({label}) "
-                                   f"HTTP {resp.status_code} → {_snip(resp.text, 320)}")
+                        data = await _nr_probe(latest - margin - 2000,
+                                               latest - margin)
+                        if data.get("error"):
+                            out.append(f"[{name}] 索引探测 -{margin:,}块 → "
+                                       f"{_snip(data['error'].get('message'), 60)}")
+                        else:
+                            n = len((data.get('result') or {}).get('transfers') or [])
+                            out.append(f"[{name}] 索引探测 -{margin:,}块 → OK,{n} 条")
+                            if good_margin is None:
+                                good_margin = margin
                     except Exception as e:
-                        out.append(f"[{name}] 交易查询({label}) → 异常: {_snip(e)}")
+                        out.append(f"[{name}] 索引探测 -{margin:,}块 → 异常: {_snip(e)}")
                     await asyncio.sleep(REQUEST_GAP)
+                if good_margin is not None:
+                    try:
+                        to_b = latest - good_margin
+                        data = await _nr_probe(to_b - 1_990_000, to_b, "0x5")
+                        out.append(f"[{name}] 宽范围查询(-{good_margin:,}块起,199万范围) → "
+                                   f"{_snip(data, 400)}")
+                    except Exception as e:
+                        out.append(f"[{name}] 宽范围查询 → 异常: {_snip(e)}")
+                    await asyncio.sleep(REQUEST_GAP)
+                else:
+                    out.append(f"[{name}] ⚠️ 索引落后超过 100 万块,增强查询暂不可用"
+                               f"(监控由 nonce/余额哨兵兜底)")
             try:
                 padded = "0x" + address.lower().replace("0x", "").rjust(64, "0")
                 logs = await _rpc_call(client, url, "eth_getLogs", [{
