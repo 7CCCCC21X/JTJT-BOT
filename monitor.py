@@ -143,17 +143,19 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
         return None
     start = int(params.get("startblock", 0) or 0)
     limit = min(int(params.get("offset", 50) or 50), 1000)
-    base = {
-        "category": ["external"],
-        "address": params.get("address", ""),
-        "fromBlock": hex(max(start, 0)),
-        "toBlock": "latest",
-        "excludeZeroValue": False,
-        "maxCount": hex(limit),
-        "order": "desc" if params.get("sort") == "desc" else "asc",
-    }
     rows, seen = [], set()
     try:
+        # toBlock 必须是明确的十六进制区块号,"latest" 关键字会导致空结果
+        latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
+        base = {
+            "category": ["external"],
+            "address": params.get("address", ""),
+            "fromBlock": hex(max(start, 1)),
+            "toBlock": hex(latest),
+            "excludeZeroValue": False,
+            "maxCount": hex(limit),
+            "order": "desc" if params.get("sort") == "desc" else "asc",
+        }
         for direction in ("from", "to"):
             res = await _rpc_call(client, url, "nr_getTransactionByAddress",
                                   [{**base, "addressType": direction}])
@@ -694,20 +696,32 @@ async def debug_report(chain: str, address: str) -> str:
                 continue
             await asyncio.sleep(REQUEST_GAP)
             if _is_nodereal(url):
-                try:
-                    resp = await client.post(url, json={
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "nr_getTransactionByAddress",
-                        "params": [{"category": ["external"], "address": address,
-                                    "addressType": "from", "order": "desc",
-                                    "excludeZeroValue": False, "maxCount": "0x3",
-                                    "fromBlock": "0x0", "toBlock": "latest"}],
-                    }, timeout=30)
-                    out.append(f"[{name}] nr_getTransactionByAddress(from) "
-                               f"HTTP {resp.status_code} → {_snip(resp.text, 500)}")
-                except Exception as e:
-                    out.append(f"[{name}] nr_getTransactionByAddress → 异常: {_snip(e)}")
-                await asyncio.sleep(REQUEST_GAP)
+                variants = [
+                    ("from,hex范围", {"addressType": "from",
+                                      "fromBlock": "0x1", "toBlock": hex(latest)}),
+                    ("to,hex范围", {"addressType": "to",
+                                    "fromBlock": "0x1", "toBlock": hex(latest)}),
+                    ("from,latest关键字", {"addressType": "from",
+                                           "fromBlock": "0x1", "toBlock": "latest"}),
+                    ("from,含内部+代币", {"addressType": "from",
+                                          "fromBlock": "0x1", "toBlock": hex(latest),
+                                          "category": ["external", "internal", "20"]}),
+                ]
+                for label, extra in variants:
+                    body = {"category": ["external"], "address": address,
+                            "order": "desc", "excludeZeroValue": False,
+                            "maxCount": "0x3", **extra}
+                    try:
+                        resp = await client.post(url, json={
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "nr_getTransactionByAddress",
+                            "params": [body],
+                        }, timeout=30)
+                        out.append(f"[{name}] 交易查询({label}) "
+                                   f"HTTP {resp.status_code} → {_snip(resp.text, 320)}")
+                    except Exception as e:
+                        out.append(f"[{name}] 交易查询({label}) → 异常: {_snip(e)}")
+                    await asyncio.sleep(REQUEST_GAP)
             try:
                 padded = "0x" + address.lower().replace("0x", "").rjust(64, "0")
                 logs = await _rpc_call(client, url, "eth_getLogs", [{
