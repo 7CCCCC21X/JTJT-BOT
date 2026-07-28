@@ -145,21 +145,41 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
     limit = min(int(params.get("offset", 50) or 50), 1000)
     rows, seen = [], set()
     try:
-        # toBlock 必须是明确的十六进制区块号("latest" 会静默返回空),
-        # 且 fromBlock~toBlock 范围必须小于 2,000,000 个区块
+        # 三个实测出的规则:
+        # 1) toBlock 必须是明确的十六进制区块号("latest" 会静默返回空)
+        # 2) fromBlock~toBlock 范围必须小于 2,000,000 个区块
+        # 3) 索引落后链头,toBlock 太新会报 "blockNum not reached" → 往回退再试
         latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
-        base = {
-            "category": ["external"],
-            "address": params.get("address", ""),
-            "fromBlock": hex(max(start, latest - 1_990_000, 1)),
-            "toBlock": hex(latest),
-            "excludeZeroValue": False,
-            "maxCount": hex(limit),
-            "order": "desc" if params.get("sort") == "desc" else "asc",
-        }
-        for direction in ("from", "to"):
-            res = await _rpc_call(client, url, "nr_getTransactionByAddress",
-                                  [{**base, "addressType": direction}])
+        results = None
+        for margin in (100, 5_000, 50_000):
+            to_block = max(latest - margin, 1)
+            frm_block = min(max(start, to_block - 1_990_000, 1), to_block)
+            base = {
+                "category": ["external"],
+                "address": params.get("address", ""),
+                "fromBlock": hex(frm_block),
+                "toBlock": hex(to_block),
+                "excludeZeroValue": False,
+                "maxCount": hex(limit),
+                "order": "desc" if params.get("sort") == "desc" else "asc",
+            }
+            try:
+                results = []
+                for direction in ("from", "to"):
+                    res = await _rpc_call(client, url, "nr_getTransactionByAddress",
+                                          [{**base, "addressType": direction}])
+                    results.append(res)
+                    await asyncio.sleep(REQUEST_GAP)
+                break
+            except EtherscanError as e:
+                if "not reached" in str(e).lower():
+                    results = None
+                    continue
+                raise
+        if results is None:
+            raise EtherscanError(
+                "nr_getTransactionByAddress: 索引落后过多 (blockNum not reached)")
+        for res in results:
             for t in (res or {}).get("transfers") or []:
                 key = t.get("uniqueId") or (t.get("hash"), t.get("from"),
                                             t.get("to"), str(t.get("value")))
