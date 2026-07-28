@@ -570,7 +570,9 @@ async def _send_recent(bot, chat_id: int, chain: str, address: str):
     except Exception as e:
         await bot.send_message(chat_id, f"❌ 查询失败: {e}")
         return
-    text = monitor.format_recent(chain, address, txs) + monitor.rpc_limit_note(chain)
+    text = (monitor.format_recent(chain, address, txs)
+            + await monitor.address_summary(chain, address)
+            + monitor.rpc_limit_note(chain))
     await bot.send_message(chat_id, text,
                            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 

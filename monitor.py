@@ -479,6 +479,26 @@ def _rpc_source(chain: str) -> str | None:
     return None
 
 
+async def address_summary(chain: str, address: str) -> str:
+    """RPC 链上的地址概况(累计发出交易数、余额),给 /recent 补充信息。"""
+    url = _rpc_source(chain)
+    if not url:
+        return ""
+    try:
+        async with httpx.AsyncClient() as client:
+            nonce = int(str(await _rpc_call(
+                client, url, "eth_getTransactionCount", [address, "latest"])), 16)
+            await asyncio.sleep(REQUEST_GAP)
+            balance = int(str(await _rpc_call(
+                client, url, "eth_getBalance", [address, "latest"])), 16)
+        native = CHAINS[chain]["native"]
+        return (f"\n\n📇 地址概况: 累计发出 {nonce:,} 笔交易 · "
+                f"余额 {_amount(str(balance), 18)} {native}")
+    except Exception as e:
+        log.debug("address summary failed: %s", e)
+        return ""
+
+
 def rpc_limit_note(chain: str) -> str:
     if _rpc_source(chain):
         return ("\n\nℹ️ 该链当前使用公共 RPC 数据源,历史查询仅覆盖代币转账事件;"
