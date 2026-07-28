@@ -107,6 +107,7 @@ HELP = f"""🤖 <b>链上监控机器人</b>
 /list — 查看当前监控列表
 /status — 查看运行状态
 /test — 发送示例推送并检测 API 连通性
+/debug [地址] [链] — 数据源深度诊断(排查查询问题用)
 /chains — 支持的链
 /id — 显示当前 chat id
 /cancel — 取消当前添加流程
@@ -330,6 +331,40 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update.effective_chat.id):
         return
     await run_test(update.effective_chat.id, context.bot)
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/debug [地址] [链] — 逐个数据源实测,输出原始诊断结果。"""
+    chat_id = update.effective_chat.id
+    if not _authorized(chat_id):
+        return
+    args = list(context.args)
+    address = None
+    chain = None
+    for a in args:
+        if ADDR_RE.match(a):
+            address = a
+        elif resolve_chain(a):
+            chain = resolve_chain(a)
+    if not address:
+        watches = store.for_chat(chat_id)
+        if watches:
+            address = watches[0].address
+            chain = chain or watches[0].chain
+        else:
+            await update.message.reply_text(
+                "用法: /debug <地址> [链](没有参数时使用你的第一条监控)")
+            return
+    chain = chain or DEFAULT_CHAIN
+    await update.message.reply_text(
+        f"🔬 正在诊断 {CHAINS[chain]['name']} / {address[:10]}…,约需 10 秒")
+    try:
+        report = await monitor.debug_report(chain, address)
+    except Exception as e:
+        report = f"诊断本身失败: {e}"
+    import html as _html
+    await update.message.reply_text(
+        f"<pre>{_html.escape(report)}</pre>", parse_mode=ParseMode.HTML)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,6 +882,7 @@ async def post_init(app: Application):
         BotCommand("list", "查看监控列表"),
         BotCommand("status", "查看运行状态"),
         BotCommand("test", "测试推送与 API 检测"),
+        BotCommand("debug", "数据源深度诊断 [地址] [链]"),
         BotCommand("label", "修改备注 <地址> [链] <备注>"),
         BotCommand("remove", "取消监控 <地址> [链]"),
         BotCommand("chains", "支持的链"),
@@ -870,6 +906,7 @@ def main():
     app.add_handler(CommandHandler("chains", cmd_chains))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler(["add", "watch"], cmd_add))
     app.add_handler(CommandHandler(["addtoken", "add_token"], cmd_addtoken))

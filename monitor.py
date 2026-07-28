@@ -631,6 +631,96 @@ async def _rpc_activity_probe(client: httpx.AsyncClient, url: str, watch) -> dic
     return None
 
 
+def _snip(x, limit: int = 220) -> str:
+    """截断并抹掉 URL 里的 API key,用于诊断输出。"""
+    import re as _re
+    s = str(x).replace("\n", " ")
+    s = _re.sub(r"/v[0-9]/[0-9a-fA-F-]{20,}", "/v1/***", s)
+    s = _re.sub(r"(apikey=)[0-9A-Za-z]+", r"\1***", s)
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
+async def debug_report(chain: str, address: str) -> str:
+    """逐个数据源实测并返回原始结果,用于 /debug 诊断。"""
+    import json as _json
+    import time as _time
+    out = [f"链: {CHAINS[chain]['name']} (chainid {CHAINS[chain]['chain_id']})",
+           f"降级模式: {'是' if chain in _fallback_chains else '否(仍走 Etherscan)'}"]
+    src = _fallback_urls.get(chain)
+    out.append(f"当前锁定源: {_snip(src[1], 80) if src else '未选定'}")
+    cooling = [f"{_snip(c[1], 40)}({int(t - _time.time())}s)"
+               for c, t in _source_cooldown.items() if t > _time.time()]
+    if cooling:
+        out.append("冷却中: " + ", ".join(cooling))
+    if _enhanced_unsupported:
+        out.append(f"已标记不支持增强接口: {len(_enhanced_unsupported)} 个节点")
+    out.append("")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            data = await _get_json(client, API_URL, {
+                "chainid": CHAINS[chain]["chain_id"], "apikey": API_KEY,
+                "module": "account", "action": "txlist", "address": address,
+                "page": 1, "offset": 2, "sort": "desc",
+                "startblock": 0, "endblock": 999999999,
+            })
+            out.append(f"[Etherscan] txlist → status={data.get('status')} "
+                       f"message={data.get('message')} result={_snip(data.get('result'))}")
+        except Exception as e:
+            out.append(f"[Etherscan] txlist → 异常: {_snip(e)}")
+        await asyncio.sleep(REQUEST_GAP)
+
+        for typ, url, with_key in _candidates(chain)[:3]:
+            name = url.split("//")[-1].split("/")[0]
+            if typ != "rpc":
+                try:
+                    p = {"module": "account", "action": "txlist", "address": address,
+                         "page": 1, "offset": 2, "sort": "desc"}
+                    if with_key:
+                        p["apikey"] = API_KEY
+                    data = await _get_json(client, url, p)
+                    out.append(f"[{name}] txlist → status={data.get('status')} "
+                               f"result={_snip(data.get('result'))}")
+                except Exception as e:
+                    out.append(f"[{name}] txlist → 异常: {_snip(e)}")
+                await asyncio.sleep(REQUEST_GAP)
+                continue
+            try:
+                bn = await _rpc_call(client, url, "eth_blockNumber", [])
+                latest = int(str(bn), 16)
+                out.append(f"[{name}] blockNumber → {latest:,}")
+            except Exception as e:
+                out.append(f"[{name}] blockNumber → 异常: {_snip(e)}")
+                continue
+            await asyncio.sleep(REQUEST_GAP)
+            if _is_nodereal(url):
+                try:
+                    resp = await client.post(url, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "nr_getTransactionByAddress",
+                        "params": [{"category": ["external"], "address": address,
+                                    "addressType": "from", "order": "desc",
+                                    "excludeZeroValue": False, "maxCount": "0x3",
+                                    "fromBlock": "0x0", "toBlock": "latest"}],
+                    }, timeout=30)
+                    out.append(f"[{name}] nr_getTransactionByAddress(from) "
+                               f"HTTP {resp.status_code} → {_snip(resp.text, 500)}")
+                except Exception as e:
+                    out.append(f"[{name}] nr_getTransactionByAddress → 异常: {_snip(e)}")
+                await asyncio.sleep(REQUEST_GAP)
+            try:
+                padded = "0x" + address.lower().replace("0x", "").rjust(64, "0")
+                logs = await _rpc_call(client, url, "eth_getLogs", [{
+                    "topics": [TRANSFER_TOPIC, padded],
+                    "fromBlock": hex(max(latest - 200, 0)), "toBlock": hex(latest),
+                }])
+                out.append(f"[{name}] getLogs(近200块,转出) → {len(logs or [])} 条")
+            except Exception as e:
+                out.append(f"[{name}] getLogs → 异常: {_snip(e)}")
+            await asyncio.sleep(REQUEST_GAP)
+    return "\n".join(out)
+
+
 def _source_name(chain: str) -> str:
     if chain not in _fallback_chains:
         return "Etherscan"
