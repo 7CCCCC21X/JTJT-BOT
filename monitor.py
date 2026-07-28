@@ -105,6 +105,84 @@ async def _rpc_call(client: httpx.AsyncClient, url: str, method: str, params: li
 
 
 _token_meta: dict[tuple, tuple[str, int]] = {}  # (rpc_url, contract) -> (symbol, decimals)
+_enhanced_unsupported: set[str] = set()  # 确认不支持增强接口的节点
+
+
+def _is_nodereal(url: str) -> bool:
+    return "nodereal.io" in url
+
+
+def _iso_to_epoch(raw) -> str:
+    if not raw:
+        return "0"
+    from datetime import datetime
+    try:
+        return str(int(datetime.fromisoformat(
+            str(raw).replace("Z", "+00:00")).timestamp()))
+    except ValueError:
+        return "0"
+
+
+async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
+                              params: dict) -> list[dict] | None:
+    """NodeReal 增强接口 nr_getAssetTransfers 查原生交易历史。
+
+    节点不支持该方法时返回 None(并记忆,之后不再尝试)。
+    """
+    if url in _enhanced_unsupported:
+        return None
+    start = int(params.get("startblock", 0) or 0)
+    limit = int(params.get("offset", 50) or 50)
+    base = {
+        "category": ["external"],
+        "fromBlock": hex(max(start, 0)),
+        "toBlock": "latest",
+        "withMetadata": True,
+        "maxCount": hex(limit),
+        "order": "desc" if params.get("sort") == "desc" else "asc",
+    }
+    address = params.get("address", "")
+    rows, seen = [], set()
+    try:
+        for field in ("fromAddress", "toAddress"):
+            res = await _rpc_call(client, url, "nr_getAssetTransfers",
+                                  [{**base, field: address}])
+            for t in (res or {}).get("transfers") or []:
+                key = t.get("uniqueId") or (t.get("hash"), t.get("from"),
+                                            t.get("to"), str(t.get("value")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw = (t.get("rawContract") or {}).get("value")
+                if raw:
+                    value = str(int(str(raw), 16))
+                else:
+                    value = str(int(round(float(t.get("value") or 0) * 1e18)))
+                rows.append({
+                    "hash": t.get("hash", ""),
+                    "blockNumber": str(int(str(t.get("blockNum", "0x0")), 16)),
+                    "timeStamp": _iso_to_epoch(
+                        (t.get("metadata") or {}).get("blockTimestamp")),
+                    "from": t.get("from", "") or "",
+                    "to": t.get("to", "") or "",
+                    "value": value,
+                    "isError": "0",
+                    "transactionIndex": "0",
+                })
+            await asyncio.sleep(REQUEST_GAP)
+    except EtherscanError as e:
+        if _is_rate_limited(e):
+            raise
+        msg = str(e).lower()
+        if ("not exist" in msg or "not found" in msg or "unsupported" in msg
+                or "not available" in msg or "method" in msg):
+            _enhanced_unsupported.add(url)
+            log.info("enhanced API unavailable on %s: %s", url, e)
+            return None
+        raise
+    rows.sort(key=lambda r: int(r["blockNumber"]),
+              reverse=(params.get("sort") == "desc"))
+    return rows[:limit]
 
 
 async def _token_info(client: httpx.AsyncClient, url: str, contract: str) -> tuple[str, int]:
@@ -240,7 +318,11 @@ async def _fallback_do(client: httpx.AsyncClient, cand: tuple[str, str, bool],
         if action == "tokentx":
             return await _rpc_tokentx(client, url, params)
         if action == "txlist":
-            # RPC 节点没有地址索引,原生币交易查不了;代币转账仍全覆盖
+            # NodeReal 有增强接口可以按地址查原生交易;其他 RPC 节点没有索引
+            if _is_nodereal(url):
+                rows = await _nr_asset_transfers(client, url, params)
+                if rows is not None:
+                    return rows
             return []
         raise EtherscanError(f"RPC 源不支持 {action}")
     p = dict(params)
@@ -411,8 +493,10 @@ async def fetch_new_txs(client: httpx.AsyncClient, watch: Watch) -> list[dict]:
     fresh.sort(key=lambda t: (int(t.get("blockNumber", 0) or 0),
                               int(t.get("transactionIndex", 0) or 0)))
 
-    # RPC 数据源查不到普通交易/合约调用,用 nonce+余额哨兵兜底提醒
+    # 数据源查不到普通交易/合约调用时(无增强接口的 RPC),用 nonce+余额哨兵兜底
     rpc_url = _rpc_source(watch.chain)
+    if rpc_url and _is_nodereal(rpc_url) and rpc_url not in _enhanced_unsupported:
+        rpc_url = None  # 增强接口已提供完整交易,无需哨兵
     if watch.kind == "address" and rpc_url:
         try:
             notice = await _rpc_activity_probe(client, rpc_url, watch)
@@ -500,10 +584,13 @@ async def address_summary(chain: str, address: str) -> str:
 
 
 def rpc_limit_note(chain: str) -> str:
-    if _rpc_source(chain):
-        return ("\n\nℹ️ 该链当前使用公共 RPC 数据源,历史查询仅覆盖代币转账事件;"
-                "合约调用和原生币交易请点上方地址到浏览器查看。")
-    return ""
+    url = _rpc_source(chain)
+    if not url:
+        return ""
+    if _is_nodereal(url) and url not in _enhanced_unsupported:
+        return ""  # NodeReal 增强接口可查全量交易,无需提示
+    return ("\n\nℹ️ 该链当前使用公共 RPC 数据源,历史查询仅覆盖代币转账事件;"
+            "合约调用和原生币交易请点上方地址到浏览器查看。")
 
 
 async def _rpc_activity_probe(client: httpx.AsyncClient, url: str, watch) -> dict | None:
