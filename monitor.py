@@ -113,40 +113,50 @@ def _is_nodereal(url: str) -> bool:
 
 
 def _iso_to_epoch(raw) -> str:
+    """时间戳兼容:ISO 字符串 / 十六进制 / 十进制秒。"""
     if not raw:
         return "0"
+    s = str(raw)
+    if s.startswith("0x"):
+        try:
+            return str(int(s, 16))
+        except ValueError:
+            return "0"
+    if s.isdigit():
+        return s
     from datetime import datetime
     try:
         return str(int(datetime.fromisoformat(
-            str(raw).replace("Z", "+00:00")).timestamp()))
+            s.replace("Z", "+00:00")).timestamp()))
     except ValueError:
         return "0"
 
 
 async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
                               params: dict) -> list[dict] | None:
-    """NodeReal 增强接口 nr_getAssetTransfers 查原生交易历史。
+    """NodeReal 增强接口 nr_getTransactionByAddress 查原生交易历史。
 
-    节点不支持该方法时返回 None(并记忆,之后不再尝试)。
+    要点: excludeZeroValue 必须为 false(合约调用都是 0 值交易);
+    支持大区块范围。节点不支持该方法时返回 None(并记忆,之后不再尝试)。
     """
     if url in _enhanced_unsupported:
         return None
     start = int(params.get("startblock", 0) or 0)
-    limit = int(params.get("offset", 50) or 50)
+    limit = min(int(params.get("offset", 50) or 50), 1000)
     base = {
         "category": ["external"],
+        "address": params.get("address", ""),
         "fromBlock": hex(max(start, 0)),
         "toBlock": "latest",
-        "withMetadata": True,
+        "excludeZeroValue": False,
         "maxCount": hex(limit),
         "order": "desc" if params.get("sort") == "desc" else "asc",
     }
-    address = params.get("address", "")
     rows, seen = [], set()
     try:
-        for field in ("fromAddress", "toAddress"):
-            res = await _rpc_call(client, url, "nr_getAssetTransfers",
-                                  [{**base, field: address}])
+        for direction in ("from", "to"):
+            res = await _rpc_call(client, url, "nr_getTransactionByAddress",
+                                  [{**base, "addressType": direction}])
             for t in (res or {}).get("transfers") or []:
                 key = t.get("uniqueId") or (t.get("hash"), t.get("from"),
                                             t.get("to"), str(t.get("value")))
@@ -158,11 +168,13 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
                     value = str(int(str(raw), 16))
                 else:
                     value = str(int(round(float(t.get("value") or 0) * 1e18)))
+                block_raw = str(t.get("blockNum") or t.get("blockNumber") or "0x0")
+                block = int(block_raw, 16) if block_raw.startswith("0x") else int(block_raw)
+                ts = (t.get("metadata") or {}).get("blockTimestamp") or t.get("blockTimeStamp")
                 rows.append({
-                    "hash": t.get("hash", ""),
-                    "blockNumber": str(int(str(t.get("blockNum", "0x0")), 16)),
-                    "timeStamp": _iso_to_epoch(
-                        (t.get("metadata") or {}).get("blockTimestamp")),
+                    "hash": t.get("hash") or t.get("transactionHash") or "",
+                    "blockNumber": str(block),
+                    "timeStamp": _iso_to_epoch(ts),
                     "from": t.get("from", "") or "",
                     "to": t.get("to", "") or "",
                     "value": value,
