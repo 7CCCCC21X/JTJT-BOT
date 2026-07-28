@@ -145,12 +145,13 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
     limit = min(int(params.get("offset", 50) or 50), 1000)
     rows, seen = [], set()
     try:
-        # toBlock 必须是明确的十六进制区块号,"latest" 关键字会导致空结果
+        # toBlock 必须是明确的十六进制区块号("latest" 会静默返回空),
+        # 且 fromBlock~toBlock 范围必须小于 2,000,000 个区块
         latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
         base = {
             "category": ["external"],
             "address": params.get("address", ""),
-            "fromBlock": hex(max(start, 1)),
+            "fromBlock": hex(max(start, latest - 1_990_000, 1)),
             "toBlock": hex(latest),
             "excludeZeroValue": False,
             "maxCount": hex(limit),
@@ -359,8 +360,9 @@ async def _fallback_query(client: httpx.AsyncClient, chain: str,
     now = _time.time()
     errors = []
     tried: list[tuple] = []
-    ordered = ([_fallback_urls[chain]] if chain in _fallback_urls else []) + \
-        [c for c in _candidates(chain) if c != _fallback_urls.get(chain)]
+    # 按候选顺序尝试(环境变量配置的专属源永远排最前),不固守上次的赢家:
+    # 否则公共节点一旦被缓存,专属源就再也轮不上了
+    ordered = _candidates(chain)
     # 跳过还在冷却期的源;若全部在冷却,则只温和地试冷却最早到期的那一个,
     # 避免每轮把所有源轰一遍、让限流计数器永远无法恢复
     available = [c for c in ordered if _source_cooldown.get(c, 0) <= now]
@@ -696,16 +698,12 @@ async def debug_report(chain: str, address: str) -> str:
                 continue
             await asyncio.sleep(REQUEST_GAP)
             if _is_nodereal(url):
+                frm = hex(max(latest - 1_990_000, 1))
                 variants = [
-                    ("from,hex范围", {"addressType": "from",
-                                      "fromBlock": "0x1", "toBlock": hex(latest)}),
-                    ("to,hex范围", {"addressType": "to",
-                                    "fromBlock": "0x1", "toBlock": hex(latest)}),
-                    ("from,latest关键字", {"addressType": "from",
-                                           "fromBlock": "0x1", "toBlock": "latest"}),
-                    ("from,含内部+代币", {"addressType": "from",
-                                          "fromBlock": "0x1", "toBlock": hex(latest),
-                                          "category": ["external", "internal", "20"]}),
+                    ("from,199万块", {"addressType": "from",
+                                      "fromBlock": frm, "toBlock": hex(latest)}),
+                    ("to,199万块", {"addressType": "to",
+                                    "fromBlock": frm, "toBlock": hex(latest)}),
                 ]
                 for label, extra in variants:
                     body = {"category": ["external"], "address": address,
