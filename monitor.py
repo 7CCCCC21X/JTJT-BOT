@@ -237,11 +237,16 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
                 if key in seen:
                     continue
                 seen.add(key)
+                # value 字段格式因接口而异:0x 开头十六进制 wei /
+                # 带小数点的原生币数量 / 十进制 wei 字符串
                 raw = (t.get("rawContract") or {}).get("value")
-                if raw:
-                    value = str(int(str(raw), 16))
+                v = str(raw if raw is not None else (t.get("value") or "0"))
+                if v.startswith("0x"):
+                    value = str(int(v, 16))
+                elif "." in v:
+                    value = str(int(round(float(v) * 1e18)))
                 else:
-                    value = str(int(round(float(t.get("value") or 0) * 1e18)))
+                    value = v or "0"
                 block_raw = str(t.get("blockNum") or t.get("blockNumber") or "0x0")
                 block = int(block_raw, 16) if block_raw.startswith("0x") else int(block_raw)
                 ts = (t.get("metadata") or {}).get("blockTimestamp") or t.get("blockTimeStamp")
