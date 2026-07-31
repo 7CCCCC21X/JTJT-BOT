@@ -629,23 +629,26 @@ async def _finalize_pending(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if not entries or not chains:
         return
     kind = pending.get("kind", "address")
+    det = pending.get("detect") or {}
     parts = []
+    auto_switched = []
     for address, inline_label in entries:
         label = inline_label or pending.get("label", "")
         for c in chains:
-            parts.append(await create_watch(chat_id, address, c, kind, label))
-    # 选了地址监控但检测到是代币合约:提醒两种监控的区别
-    det = pending.get("detect") or {}
-    if kind == "address":
-        token_chains = [CHAINS[c]["name"] for c in chains
-                        if det.get(c, {}).get("type") == "token"]
-        if token_chains:
-            parts.append(
-                "⚠️ 注意:该地址在 " + "、".join(token_chains) + " 上是代币合约。\n"
-                "「地址监控」只跟踪合约自身收发的交易,"
-                "别人之间转这个代币<b>不会</b>触发提醒;\n"
-                "要监控该代币的所有转账,请用 🪙代币监控重新添加"
-                "(/addtoken 或发送地址后选代币监控)。")
+            k = kind
+            # 识别到代币合约:自动改用代币监控(监控该代币的所有转账),
+            # 地址监控盯代币合约几乎必然不是用户本意
+            if kind == "address" and det.get(c, {}).get("type") == "token":
+                k = "token"
+                symbol = det[c].get("symbol")
+                auto_switched.append(
+                    f"{CHAINS[c]['name']}" + (f" ({symbol})" if symbol else ""))
+            parts.append(await create_watch(chat_id, address, c, k, label))
+    if auto_switched:
+        parts.append(
+            "ℹ️ 检测到代币合约,已自动按 🪙<b>代币监控</b>添加:"
+            + "、".join(auto_switched)
+            + "\n该代币的<b>所有转账</b>(任何人之间)都会推送提醒。")
     markup = _recent_buttons(chains, entries[0][0]) if len(entries) == 1 else None
     # Telegram 单条消息 4096 字符上限,批量添加时分段发送
     chunk: list[str] = []
