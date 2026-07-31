@@ -38,7 +38,6 @@ FALLBACKS: dict[str, list[tuple[str, str, bool]]] = {
     "bsc": [("rpc", "https://bsc.drpc.org", False),
             ("rpc", "https://1rpc.io/bnb", False),
             ("rpc", "https://bsc.meowrpc.com", False),
-            ("rpc", "https://binance.llamarpc.com", False),
             ("rpc", "https://bsc-rpc.publicnode.com", False),
             ("rpc", "https://bsc-dataseed.bnbchain.org", False),
             ("rpc", "https://bsc-dataseed1.bnbchain.org", False)],
@@ -178,89 +177,136 @@ def _iso_to_epoch(raw) -> str:
         return "0"
 
 
-async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
-                              params: dict) -> list[dict] | None:
-    """NodeReal 增强接口 nr_getTransactionByAddress 查原生交易历史。
+_nr_recent_cache: dict[tuple, tuple[float, list, list]] = {}  # 合并查询的短暂缓存
 
-    要点: excludeZeroValue 必须为 false(合约调用都是 0 值交易);
-    支持大区块范围。节点不支持该方法时返回 None(并记忆,之后不再尝试)。
+
+def _parse_nr_value(t: dict) -> str:
+    """value 字段格式因接口而异:0x十六进制 / 带小数点数量 / 十进制字符串。"""
+    raw = (t.get("rawContract") or {}).get("value")
+    v = str(raw if raw is not None else (t.get("value") or "0"))
+    if v.startswith("0x"):
+        return str(int(v, 16))
+    if "." in v:
+        return str(int(round(float(v) * 1e18)))
+    return v or "0"
+
+
+def _nr_common_fields(t: dict) -> dict:
+    block_raw = str(t.get("blockNum") or t.get("blockNumber") or "0x0")
+    block = int(block_raw, 16) if block_raw.startswith("0x") else int(block_raw)
+    ts = (t.get("metadata") or {}).get("blockTimestamp") or t.get("blockTimeStamp")
+    return {
+        "hash": t.get("hash") or t.get("transactionHash") or "",
+        "blockNumber": str(block),
+        "timeStamp": _iso_to_epoch(ts),
+        "from": t.get("from", "") or "",
+        "to": t.get("to", "") or "",
+        "value": _parse_nr_value(t),
+        "isError": "0",
+        "transactionIndex": "0",
+        "logIndex": str(t.get("id") or ""),
+    }
+
+
+def _nr_contract_of(t: dict) -> str:
+    c = t.get("contractAddress") or (t.get("rawContract") or {}).get("address")
+    if isinstance(c, dict):
+        c = c.get("address") or c.get("hash")
+    return str(c or "")
+
+
+async def _nr_address_rows(client: httpx.AsyncClient, url: str,
+                           params: dict) -> tuple[list, list] | None:
+    """一次查询同时拉取地址的原生交易 + 代币转账(category external+20)。
+
+    合并省一半调用量;结果拆成 (原生行, 代币行) 并缓存 25 秒,
+    同一轮轮询里 txlist 和 tokentx 共享一次查询。
+    接口不支持返回 None;索引落后过多返回空两组(哨兵兜底)。
+    实测规则: toBlock 必须是明确十六进制(latest 会静默空返回)、
+    范围 <200 万块、索引落后时报 blockNum not reached。
     """
     if url in _enhanced_unsupported:
         return None
+    import time as _time
+    address = (params.get("address") or "").lower()
     start = int(params.get("startblock", 0) or 0)
+    sort = "desc" if params.get("sort") == "desc" else "asc"
     limit = min(int(params.get("offset", 50) or 50), 1000)
-    rows, seen = [], set()
+    key = (url, address, start, sort)
+    cached = _nr_recent_cache.get(key)
+    if cached and _time.time() - cached[0] < 25:
+        return cached[1][:limit], cached[2][:limit]
     try:
-        # 三个实测出的规则:
-        # 1) toBlock 必须是明确的十六进制区块号("latest" 会静默返回空)
-        # 2) fromBlock~toBlock 范围必须小于 2,000,000 个区块
-        # 3) 索引落后链头,toBlock 太新会报 "blockNum not reached" → 往回退再试
         latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
-        margin = await _nr_working_margin(client, url,
-                                          params.get("address", ""), latest)
+        margin = await _nr_working_margin(client, url, address, latest)
         if margin is None:
-            # 索引落后过多:本轮放弃增强查询,交给哨兵兜底,不报错
             _enhanced_ok[url] = False
             log.warning("NodeReal index too far behind on %s, "
                         "falling back to sentinel mode", url)
-            return []
+            return [], []
         to_block = max(latest - margin, 1)
         frm_block = min(max(start, to_block - 1_990_000, 1), to_block)
         base = {
-            "category": ["external"],
-            "address": params.get("address", ""),
+            "category": ["external", "20"],
+            "address": address,
             "fromBlock": hex(frm_block),
             "toBlock": hex(to_block),
             "excludeZeroValue": False,
-            "maxCount": hex(limit),
-            "order": "desc" if params.get("sort") == "desc" else "asc",
+            "maxCount": hex(max(limit, 20)),
+            "order": sort,
         }
-        results = []
+        items, seen = [], set()
         try:
             for direction in ("from", "to"):
                 res = await _rpc_call(client, url, "nr_getTransactionByAddress",
                                       [{**base, "addressType": direction}])
-                results.append(res)
+                for t in (res or {}).get("transfers") or []:
+                    k = t.get("uniqueId") or t.get("id") or (
+                        t.get("hash"), t.get("from"), t.get("to"),
+                        str(t.get("value")))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    items.append(t)
                 await asyncio.sleep(REQUEST_GAP)
         except EtherscanError as e:
             if "not reached" in str(e).lower():
                 # 缓存的边距失效(索引回退),下轮重新探测
                 _nr_margins.pop(url, None)
                 _enhanced_ok[url] = False
-                return []
+                return [], []
             raise
+        native, tokens = [], []
+        for t in items:
+            cat = str(t.get("category") or "").lower()
+            row = _nr_common_fields(t)
+            if cat == "external":
+                native.append(row)
+            elif cat in ("20", "erc20"):
+                contract = _nr_contract_of(t)
+                symbol = (t.get("asset") or "").strip()
+                decimals = None
+                meta = t.get("rawContract") or {}
+                if meta.get("decimal"):
+                    d = str(meta["decimal"])
+                    decimals = int(d, 16) if d.startswith("0x") else int(d)
+                if contract and (not symbol or decimals is None):
+                    s2, d2 = await _token_info(client, url, contract)
+                    symbol = symbol or s2
+                    decimals = d2 if decimals is None else decimals
+                row["tokenSymbol"] = symbol or "TOKEN"
+                row["tokenDecimal"] = str(decimals if decimals is not None else 18)
+                row["contractAddress"] = contract
+                tokens.append(row)
+        rev = sort == "desc"
+        native.sort(key=lambda r: int(r["blockNumber"]), reverse=rev)
+        tokens.sort(key=lambda r: int(r["blockNumber"]), reverse=rev)
         _enhanced_ok[url] = True
-        for res in results:
-            for t in (res or {}).get("transfers") or []:
-                key = t.get("uniqueId") or (t.get("hash"), t.get("from"),
-                                            t.get("to"), str(t.get("value")))
-                if key in seen:
-                    continue
-                seen.add(key)
-                # value 字段格式因接口而异:0x 开头十六进制 wei /
-                # 带小数点的原生币数量 / 十进制 wei 字符串
-                raw = (t.get("rawContract") or {}).get("value")
-                v = str(raw if raw is not None else (t.get("value") or "0"))
-                if v.startswith("0x"):
-                    value = str(int(v, 16))
-                elif "." in v:
-                    value = str(int(round(float(v) * 1e18)))
-                else:
-                    value = v or "0"
-                block_raw = str(t.get("blockNum") or t.get("blockNumber") or "0x0")
-                block = int(block_raw, 16) if block_raw.startswith("0x") else int(block_raw)
-                ts = (t.get("metadata") or {}).get("blockTimestamp") or t.get("blockTimeStamp")
-                rows.append({
-                    "hash": t.get("hash") or t.get("transactionHash") or "",
-                    "blockNumber": str(block),
-                    "timeStamp": _iso_to_epoch(ts),
-                    "from": t.get("from", "") or "",
-                    "to": t.get("to", "") or "",
-                    "value": value,
-                    "isError": "0",
-                    "transactionIndex": "0",
-                })
-            await asyncio.sleep(REQUEST_GAP)
+        if len(_nr_recent_cache) > 60:
+            oldest = min(_nr_recent_cache, key=lambda k: _nr_recent_cache[k][0])
+            _nr_recent_cache.pop(oldest, None)
+        _nr_recent_cache[key] = (_time.time(), native, tokens)
+        return native[:limit], tokens[:limit]
     except EtherscanError as e:
         if _is_rate_limited(e):
             raise
@@ -271,9 +317,6 @@ async def _nr_asset_transfers(client: httpx.AsyncClient, url: str,
             log.info("enhanced API unavailable on %s: %s", url, e)
             return None
         raise
-    rows.sort(key=lambda r: int(r["blockNumber"]),
-              reverse=(params.get("sort") == "desc"))
-    return rows[:limit]
 
 
 async def _token_info(client: httpx.AsyncClient, url: str, contract: str) -> tuple[str, int]:
@@ -307,6 +350,15 @@ async def _token_info(client: httpx.AsyncClient, url: str, contract: str) -> tup
 
 async def _rpc_tokentx(client: httpx.AsyncClient, url: str, params: dict) -> list[dict]:
     """用 eth_getLogs 拉取 ERC-20 Transfer 事件,适配成 tokentx 行格式。"""
+    if not ("contractaddress" in params and "address" not in params):
+        # 地址维度的代币转账:NodeReal 走合并查询(与 txlist 共享缓存,不额外耗费);
+        # 公共节点拒绝无 address 限定的全网日志扫描,直接跳过,由哨兵兜底
+        if _is_nodereal(url):
+            pair = await _nr_address_rows(client, url, params)
+            if pair is not None:
+                return pair[1]
+        log.debug("skip topic-only getLogs on %s", url)
+        return []
     latest = int(str(await _rpc_call(client, url, "eth_blockNumber", [])), 16)
     want_start = int(params.get("startblock", 0) or 0)
     span = _rpc_spans.get(url, RPC_LOG_SPAN)
@@ -411,9 +463,9 @@ async def _fallback_do(client: httpx.AsyncClient, cand: tuple[str, str, bool],
         if action == "txlist":
             # NodeReal 有增强接口可以按地址查原生交易;其他 RPC 节点没有索引
             if _is_nodereal(url):
-                rows = await _nr_asset_transfers(client, url, params)
-                if rows is not None:
-                    return rows
+                pair = await _nr_address_rows(client, url, params)
+                if pair is not None:
+                    return pair[0]
             return []
         raise EtherscanError(f"RPC 源不支持 {action}")
     p = dict(params)
