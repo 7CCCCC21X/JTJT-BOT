@@ -907,39 +907,49 @@ async def detect_address(address: str) -> dict[str, dict]:
     result: dict[str, dict] = {}
     async with httpx.AsyncClient() as client:
         for chain in CHAINS:
-            info = {"type": "eoa", "symbol": None}
-            code = None
-            try:
-                code = await _proxy(client, chain, "eth_getCode",
-                                    {"address": address, "tag": "latest"})
-            except Exception as e:
-                log.debug("getCode failed on %s: %s", chain, e)
-            is_contract = (isinstance(code, str) and code.startswith("0x")
-                           and len(code) > 4)
-            # getCode 拿不到明确结果(接口不可用/被套餐限制)时也去探测代币转账,
-            # 避免像 Base 这种链把代币合约误判成普通地址
-            code_unknown = not (isinstance(code, str) and code.startswith("0x"))
-            if is_contract or code_unknown:
-                await asyncio.sleep(REQUEST_GAP)
-                try:
-                    rows = await _query(client, chain, {
-                        "module": "account", "action": "tokentx",
-                        "contractaddress": address,
-                        "page": 1, "offset": 1, "sort": "desc",
-                        "startblock": 0, "endblock": 999999999,
-                    })
-                    if rows:
-                        info["type"] = "token"
-                        info["symbol"] = rows[0].get("tokenSymbol") or None
-                    elif is_contract:
-                        info["type"] = "contract"
-                except Exception as e:
-                    log.debug("tokentx probe failed on %s: %s", chain, e)
-                    if is_contract:
-                        info["type"] = "contract"
-            result[chain] = info
+            result[chain] = await _detect_one(client, chain, address)
             await asyncio.sleep(REQUEST_GAP)
     return result
+
+
+async def _detect_one(client: httpx.AsyncClient, chain: str, address: str) -> dict:
+    info = {"type": "eoa", "symbol": None}
+    code = None
+    try:
+        code = await _proxy(client, chain, "eth_getCode",
+                            {"address": address, "tag": "latest"})
+    except Exception as e:
+        log.debug("getCode failed on %s: %s", chain, e)
+    is_contract = (isinstance(code, str) and code.startswith("0x")
+                   and len(code) > 4)
+    # getCode 拿不到明确结果(接口不可用/被套餐限制)时也去探测代币转账,
+    # 避免像 Base 这种链把代币合约误判成普通地址
+    code_unknown = not (isinstance(code, str) and code.startswith("0x"))
+    if is_contract or code_unknown:
+        await asyncio.sleep(REQUEST_GAP)
+        try:
+            rows = await _query(client, chain, {
+                "module": "account", "action": "tokentx",
+                "contractaddress": address,
+                "page": 1, "offset": 1, "sort": "desc",
+                "startblock": 0, "endblock": 999999999,
+            })
+            if rows:
+                info["type"] = "token"
+                info["symbol"] = rows[0].get("tokenSymbol") or None
+            elif is_contract:
+                info["type"] = "contract"
+        except Exception as e:
+            log.debug("tokentx probe failed on %s: %s", chain, e)
+            if is_contract:
+                info["type"] = "contract"
+    return info
+
+
+async def detect_on_chain(chain: str, address: str) -> dict:
+    """单链版地址类型识别(自愈迁移用)。"""
+    async with httpx.AsyncClient() as client:
+        return await _detect_one(client, chain, address)
 
 
 async def fetch_recent(chain: str, address: str, limit: int = 10) -> list[dict]:

@@ -830,6 +830,46 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- 轮询 ----------
 
+async def migrate_token_watches(context: ContextTypes.DEFAULT_TYPE):
+    """自愈:把误加成地址监控的代币合约自动转换为代币监控。"""
+    converted: list[tuple[Watch, str | None]] = []
+    for w in list(store.watches.values()):
+        if w.kind != "address":
+            continue
+        try:
+            info = await monitor.detect_on_chain(w.chain, w.address)
+        except Exception as e:
+            log.debug("migrate detect failed for %s/%s: %s",
+                      w.chain, w.address, e)
+            continue
+        if info.get("type") == "token":
+            store.watches.pop(w.key, None)
+            w.kind = "token"
+            store.watches[w.key] = w
+            converted.append((w, info.get("symbol")))
+        await asyncio.sleep(monitor.REQUEST_GAP)
+    if not converted:
+        return
+    store.save()
+    by_chat: dict[int, list] = {}
+    for w, sym in converted:
+        by_chat.setdefault(w.chat_id, []).append((w, sym))
+    for chat_id, items in by_chat.items():
+        lines = []
+        for w, sym in items:
+            name = w.label or (w.address[:10] + "…")
+            lines.append(f"• [{CHAINS[w.chain]['name']}] {name}"
+                         + (f" — {sym}" if sym else ""))
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "🔄 检测到以下监控目标是<b>代币合约</b>,已自动转为 🪙代币监控,"
+                "该代币任何人之间的转账都会推送提醒:\n" + "\n".join(lines),
+                parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("migrate notify failed: %s", e)
+
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     STATS["polls"] += 1
     STATS["last_poll"] = time.time()
@@ -933,6 +973,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=5)
+    # 启动 20 秒后体检一次监控类型,之后每 6 小时一次
+    app.job_queue.run_repeating(migrate_token_watches,
+                                interval=6 * 3600, first=20)
 
     log.info("bot starting, poll interval %ss, %d watches loaded",
              POLL_INTERVAL, len(store.watches))
